@@ -44,18 +44,38 @@ fn user_tick_fn<'a>(state: &'a mut WsState) -> UserFuture<'a> {
     })
 }
 
-fn user_tick_fn_2<'a>(state: &'a mut WsState) -> UserFuture<'a> {
-    Box::pin(async move {
-        // freely read/mutate `state` across awaits
-        let before = state.connected;
-        state.connected = before; // example mutation
-        println!(
-            "⏰ periodic check 2 — connected={} last_msg={}",
-            state.connected, state.last_msg
-        );
-    })
+#[macro_export]
+macro_rules! user_async_adapter {
+    // Define a named adapter function:
+    // user_async_adapter!(my_async_fn => my_adapter_fn);
+    ($f:path => $adapter:ident) => {
+        fn $adapter<'a>(s: &'a mut WsState) -> UserFuture<'a> {
+            use futures::FutureExt;
+            $f(s).boxed()
+        }
+    };
+    // Return an adapter function item (no name), useful inline:
+    // let adapter = user_async_adapter!(my_async_fn);
+    ($f:path) => {{
+        use futures::FutureExt;
+        fn __adapter<'a>(s: &'a mut WsState) -> UserFuture<'a> {
+            $f(s).boxed()
+        }
+        __adapter
+    }};
 }
 
+async fn user_tick_fn_2(state: &mut WsState) {
+    // freely read/mutate `state` across awaits
+    let before = state.connected;
+    state.connected = before; // example mutation
+    println!(
+        "⏰ periodic check 2 — connected={} last_msg={}",
+        state.connected, state.last_msg
+    );
+}
+
+user_async_adapter!(user_tick_fn_2 => user_tick_fn_2_user);
 /// Core websocket loop; *multiple* factories are selected concurrently and executed immediately.
 async fn run_ws_loop<Data>(
     url: String,
@@ -206,6 +226,15 @@ fn chain_handlers<Data: 'static>(
 
 fn on_reconnect(_state: &mut WsState, _stream: &mut WsStream) {}
 
+async fn my_normal_async(state: &mut WsState) {
+    // use &mut state across awaits
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    println!(
+        "tick: connected={}, last_msg={}",
+        state.connected, state.last_msg
+    );
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let state = WsState {
@@ -230,7 +259,7 @@ async fn main() -> Result<()> {
         async {
             // outer async preparation for f2
             time::sleep(Duration::from_millis(900)).await;
-            Box::new(user_tick_fn_2) as Box<UserTick>
+            Box::new(user_tick_fn_2_user) as Box<UserTick>
         }
         .boxed()
     });
