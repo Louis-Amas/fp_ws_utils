@@ -46,14 +46,6 @@ fn user_tick_fn<'a>(state: &'a mut WsState) -> UserFuture<'a> {
 
 #[macro_export]
 macro_rules! user_async_adapter {
-    // Define a named adapter function:
-    // user_async_adapter!(my_async_fn => my_adapter_fn);
-    ($f:path => $adapter:ident) => {
-        fn $adapter<'a>(s: &'a mut WsState) -> UserFuture<'a> {
-            use futures::FutureExt;
-            $f(s).boxed()
-        }
-    };
     // Return an adapter function item (no name), useful inline:
     // let adapter = user_async_adapter!(my_async_fn);
     ($f:path) => {{
@@ -75,7 +67,6 @@ async fn user_tick_fn_2(state: &mut WsState) {
     );
 }
 
-user_async_adapter!(user_tick_fn_2 => user_tick_fn_2_user);
 /// Core websocket loop; *multiple* factories are selected concurrently and executed immediately.
 async fn run_ws_loop<Data>(
     url: String,
@@ -259,7 +250,7 @@ async fn main() -> Result<()> {
         async {
             // outer async preparation for f2
             time::sleep(Duration::from_millis(900)).await;
-            Box::new(user_tick_fn_2_user) as Box<UserTick>
+            Box::new(user_async_adapter!(user_tick_fn_2)) as Box<UserTick>
         }
         .boxed()
     });
