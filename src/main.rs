@@ -27,11 +27,18 @@ enum HandlerOutcome<Data> {
     Stop,
 }
 
+enum TestMsg {
+    TestA,
+    TestB,
+}
+
 type Handler<Data> = fn(&mut WsState, &Message) -> Result<HandlerOutcome<Data>>;
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
-type Factory = Arc<dyn Fn() -> BoxFuture<'static, TickFn> + Send + Sync>;
 
-// ---- HRTB-friendly types for user ticks ----
+type TickFn = for<'a> fn(&'a mut WsState, TestMsg) -> UserFuture<'a>;
+type Factory = Arc<dyn Fn() -> BoxFuture<'static, (TickFn, TestMsg)> + Send + Sync>;
+
+// ---- HRTB- types for user ticks ----
 type UserFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
 // Adapter macro for async fn(&mut WsState) -> impl Future<Output=()>
@@ -47,7 +54,7 @@ macro_rules! user_async_adapter {
 
 // ---------- Triggers ----------
 trait Trigger: Send + Sync {
-    fn arm(&self) -> BoxFuture<'static, ()>; // resolves when ready
+    fn arm(&self) -> BoxFuture<'static, TestMsg>;
 }
 type Trig = Arc<dyn Trigger>;
 
@@ -56,9 +63,14 @@ struct IntervalTrigger {
     period: Duration,
 }
 impl Trigger for IntervalTrigger {
-    fn arm(&self) -> BoxFuture<'static, ()> {
+    fn arm(&self) -> BoxFuture<'static, TestMsg> {
         let d = self.period;
-        async move { sleep(d).await }.boxed()
+        async move {
+            sleep(d).await;
+
+            TestMsg::TestA
+        }
+        .boxed()
     }
 }
 
@@ -67,9 +79,14 @@ struct NotifyTrigger {
     notify: Arc<Notify>,
 }
 impl Trigger for NotifyTrigger {
-    fn arm(&self) -> BoxFuture<'static, ()> {
+    fn arm(&self) -> BoxFuture<'static, TestMsg> {
         let n = self.notify.clone();
-        async move { n.notified().await }.boxed()
+        async move {
+            n.notified().await;
+
+            TestMsg::TestA
+        }
+        .boxed()
     }
 }
 
@@ -78,10 +95,12 @@ struct BroadcastTrigger<T: Clone + Send + 'static> {
     tx: broadcast::Sender<T>,
 }
 impl<T: Clone + Send + 'static> Trigger for BroadcastTrigger<T> {
-    fn arm(&self) -> BoxFuture<'static, ()> {
+    fn arm(&self) -> BoxFuture<'static, TestMsg> {
         let mut rx = self.tx.subscribe();
         async move {
             let _ = rx.recv().await;
+
+            TestMsg::TestA
         }
         .boxed()
     }
@@ -94,58 +113,27 @@ struct BackoffTrigger {
     state: Mutex<Duration>,
 }
 impl Trigger for BackoffTrigger {
-    fn arm(&self) -> BoxFuture<'static, ()> {
+    fn arm(&self) -> BoxFuture<'static, TestMsg> {
         let delay = {
             let mut s = self.state.lock().unwrap();
             let current = (*s).max(self.base);
             *s = (current * 2).min(self.max);
             current
         };
-        async move { sleep(delay).await }.boxed()
-    }
-}
-
-// Combinators: AnyOf, AllOf
-struct AnyOf {
-    a: Trig,
-    b: Trig,
-}
-impl Trigger for AnyOf {
-    fn arm(&self) -> BoxFuture<'static, ()> {
-        let fa = self.a.arm();
-        let fb = self.b.arm();
         async move {
-            tokio::select! {
-                _ = fa => {},
-                _ = fb => {},
-            }
+            sleep(delay).await;
+            TestMsg::TestA
         }
         .boxed()
     }
 }
-
-struct AllOf {
-    a: Trig,
-    b: Trig,
-}
-impl Trigger for AllOf {
-    fn arm(&self) -> BoxFuture<'static, ()> {
-        let fa = self.a.arm();
-        let fb = self.b.arm();
-        async move {
-            let (_ra, _rb) = tokio::join!(fa, fb);
-        }
-        .boxed()
-    }
-}
-type TickFn = for<'a> fn(&'a mut WsState) -> UserFuture<'a>;
 
 fn make_factory(trig: Trig, tick: TickFn) -> Factory {
     Arc::new(move || {
         let trig = trig.clone();
         async move {
             trig.arm().await;
-            tick // just return the function pointer
+            (tick, TestMsg::TestA)
         }
         .boxed()
     })
@@ -205,7 +193,7 @@ async fn user_tick_1(state: &mut WsState) {
     );
 }
 
-async fn user_tick_2(state: &mut WsState) {
+async fn user_tick_2(state: &mut WsState, msg: TestMsg) {
     time::sleep(Duration::from_millis(150)).await;
     println!("tick2: heavy work done; last_pong={:?}", state.last_pong);
 }
@@ -240,11 +228,17 @@ where
         on_reconnect(&mut state, &mut stream);
         println!("✅ Connected!");
 
-        let mut pending: FuturesUnordered<BoxFuture<'static, (usize, TickFn)>> =
+        let mut pending: FuturesUnordered<BoxFuture<'static, (usize, TickFn, TestMsg)>> =
             FuturesUnordered::new();
         for (i, f) in user_future_factories.iter().enumerate() {
             let f = Arc::clone(f);
-            pending.push(async move { (i, f().await) }.boxed());
+            pending.push(
+                async move {
+                    let (tick, tmsg) = f().await;
+                    (i, tick, tmsg)
+                }
+                .boxed(),
+            );
         }
 
         loop {
@@ -267,10 +261,13 @@ where
                 // Any factory became ready: run its tick, then re-arm the same factory
                 item = pending.next() => {
                     match item {
-                        Some((idx, tick)) => {
-                            (tick)(&mut state).await;
+                        Some((idx, tick, tmsg)) => {
+                            (tick)(&mut state, tmsg).await;
                             if let Some(factory) = user_future_factories.get(idx).cloned() {
-                                pending.push(async move { (idx, factory().await) }.boxed());
+                                pending.push(async move {
+                                    let (tck, tmsg2) = factory().await;
+                                    (idx, tck, tmsg2)
+                                }.boxed());
                             }
                         }
                         None => {
@@ -281,7 +278,6 @@ where
                 }
             }
         }
-
         state.connected = false;
         println!("⚠️ connection lost, retrying in 2s…");
         time::sleep(Duration::from_secs(2)).await;
@@ -344,17 +340,19 @@ async fn main() -> Result<()> {
     // });
 
     // or: either periodic 2s OR manual signal
-    let periodic_or_signal: Trig = Arc::new(AnyOf {
-        a: periodic_2s.clone(),
-        b: on_signal.clone(),
-    });
+    // let periodic_or_signal: Trig = Arc::new(AnyOf {
+    //     a: periodic_2s.clone(),
+    //     b: on_signal.clone(),
+    // });
 
     // --- build user ticks as factories
-    let f1 = make_factory(periodic_or_signal.clone(), |s| Box::pin(user_tick_1(s)));
-    let f2 = make_factory(on_notify.clone(), |s| Box::pin(user_tick_2(s)));
+    // let f1 = make_factory(periodic_or_signal.clone(), |s, msg| {
+    //     Box::pin(user_tick_1(s))
+    // });
+    let f2 = make_factory(on_notify.clone(), |s, msg| Box::pin(user_tick_2(s, msg)));
     // let f3 = make_factory(idle_then_backoff.clone(), |s| Box::pin(user_tick_2(s)));
 
-    let factories = vec![f1, f2];
+    let factories = vec![f2];
 
     // --- demo: produce some signals in background
     // every 5s, broadcast a signal
