@@ -1,6 +1,6 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 use std::time::{Duration, Instant};
 use tokio::{net::TcpStream, time};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
@@ -21,17 +21,21 @@ enum HandlerOutcome<Data> {
 type Handler<Data> = fn(&mut WsState, &Message) -> Result<HandlerOutcome<Data>>;
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-async fn run_ws_loop<Data, UFut>(
+/// Core websocket loop where user_future_factory runs inside select!
+/// and when it resolves, it immediately executes its returned closure.
+async fn run_ws_loop<Data, UFut, UFutOuter>(
     url: String,
     mut state: WsState,
     on_reconnect: impl Fn(&mut WsState, &mut WsStream) + Send + Sync + 'static,
     handler: impl Fn(&mut WsState, &Message) -> Result<HandlerOutcome<Data>> + Send + Sync + 'static,
     data_sink: impl Fn(Data) + Send + Sync + 'static,
-    user_future: &mut (impl for<'a> FnMut(&'a mut WsState) -> UFut + Send + Sync),
+    user_future_factory: impl Fn() -> UFutOuter + Send + Sync + 'static + Clone,
 ) -> Result<()>
 where
-    UFut: std::future::Future<Output = ()> + Send,
     Data: Send + 'static,
+    UFut: std::future::Future<Output = ()> + Send + 'static,
+    UFutOuter: std::future::Future<Output = Box<dyn for<'a> FnOnce(&'a mut WsState) -> UFut + Send + Sync>>
+        + Send,
 {
     loop {
         println!("🔌 Connecting to {url}...");
@@ -40,7 +44,7 @@ where
             Ok(s) => s,
             Err(e) => {
                 eprintln!("Connection failed: {e}, retrying in 3s...");
-                tokio::time::sleep(Duration::from_secs(3)).await;
+                time::sleep(Duration::from_secs(3)).await;
                 continue;
             }
         };
@@ -64,7 +68,7 @@ where
                             HandlerOutcome::Reconnect => {
                                 println!("🔁 Reconnection requested by handler");
                                 state.connected = false;
-                                break; // reconnect
+                                break;
                             }
                             HandlerOutcome::Stop => {
                                 println!("🛑 Handler requested stop");
@@ -73,31 +77,33 @@ where
                         },
                         Some(Err(e)) => {
                             eprintln!("WebSocket error: {e}");
-                            break; // reconnect
+                            break;
                         }
                         None => {
                             eprintln!("🔕 Stream closed by server");
-                            break; // reconnect
+                            break;
                         }
                     }
                 }
 
-                // --- User-specified future completed ---
-                _ = user_future(&mut state) => {
-                    println!("⚙️ User future triggered action");
-                    // The closure can mutate state or trigger other side effects.
-                    // This branch just waits again next tick.
+                // --- User future factory resolved ---
+                closure = user_future_factory() => {
+                    println!("⚙️ user_future_factory resolved — executing inner user future");
+                    let fut = closure(&mut state);
+                    fut.await;
                 }
             }
         }
 
         state.connected = false;
         println!("⚠️ Connection lost, retrying in 3s...");
+        time::sleep(Duration::from_secs(3)).await;
     }
 }
 
-fn text_logger(_state: &mut WsState, msg: &Message) -> Result<HandlerOutcome<String>> {
+fn text_logger(state: &mut WsState, msg: &Message) -> Result<HandlerOutcome<String>> {
     if let Message::Text(txt) = msg {
+        state.last_msg = Utc::now();
         println!("📜 Received text: {txt}");
     }
     Ok(HandlerOutcome::Continue(None))
@@ -125,9 +131,8 @@ fn chain_handlers<Data: 'static>(
 ) -> impl Fn(&mut WsState, &Message) -> Result<HandlerOutcome<Data>> {
     move |state: &mut WsState, msg: &Message| {
         for handler in &handlers {
-            match handler(state, &msg)? {
+            match handler(state, msg)? {
                 HandlerOutcome::Continue(maybe_data) => {
-                    // If a handler produced data, pass it along — but keep processing
                     if maybe_data.is_some() {
                         return Ok(HandlerOutcome::Continue(maybe_data));
                     }
@@ -140,7 +145,7 @@ fn chain_handlers<Data: 'static>(
     }
 }
 
-fn on_reconnect(state: &mut WsState, stream: &mut WsStream) {}
+fn on_reconnect(_state: &mut WsState, _stream: &mut WsStream) {}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -150,17 +155,24 @@ async fn main() -> Result<()> {
         last_msg: Utc::now(),
     };
 
-    // Compose a handler chain (optional)
     let combined_handler = chain_handlers(vec![pong_updater, reconnect_on_keyword, text_logger]);
 
-    let mut user_future = |state: &mut WsState| {
-        // take a snapshot
-        let connected = state.connected;
-        let time = state.last_msg;
-        async move {
-            time::sleep(Duration::from_secs(1)).await;
-            println!("⏰ periodic check — connected = {} {}", connected, time);
-        }
+    // Outer async factory that returns a closure
+    let user_future_factory = || async {
+        println!("⚙️ Outer async factory building...");
+        time::sleep(Duration::from_secs(1)).await;
+
+        Box::new(|state: &mut WsState| {
+            let connected = state.connected;
+            let last_msg = state.last_msg;
+            async move {
+                time::sleep(Duration::from_secs(1)).await;
+                println!(
+                    "⏰ periodic check — connected={} last_msg={}",
+                    connected, last_msg
+                );
+            }
+        }) as Box<dyn for<'a> FnOnce(&'a mut WsState) -> _ + Send + Sync>
     };
 
     run_ws_loop(
@@ -169,7 +181,7 @@ async fn main() -> Result<()> {
         on_reconnect,
         combined_handler,
         |msg| println!("📩 Data: {msg}"),
-        &mut user_future,
+        user_future_factory,
     )
     .await
 }
