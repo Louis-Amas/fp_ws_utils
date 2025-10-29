@@ -29,10 +29,10 @@ enum HandlerOutcome<Data> {
 
 type Handler<Data> = fn(&mut WsState, &Message) -> Result<HandlerOutcome<Data>>;
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type Factory = Arc<dyn Fn() -> BoxFuture<'static, TickFn> + Send + Sync>;
 
 // ---- HRTB-friendly types for user ticks ----
 type UserFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
-type UserTick = dyn for<'a> FnOnce(&'a mut WsState) -> UserFuture<'a> + Send + Sync;
 
 // Adapter macro for async fn(&mut WsState) -> impl Future<Output=()>
 #[macro_export]
@@ -87,29 +87,6 @@ impl<T: Clone + Send + 'static> Trigger for BroadcastTrigger<T> {
     }
 }
 
-// Fires when a watched value satisfies a predicate
-// struct WatchTrigger<T: Clone + Send + Sync + 'static> {
-//     rx: watch::Receiver<T>,
-//     pred: Arc<dyn Fn(&T) -> bool + Send + Sync>,
-// }
-// impl<T: Clone + Send + Sync + 'static> Trigger for WatchTrigger<T> {
-//     fn arm(&self) -> BoxFuture<'static, ()> {
-//         let mut rx = self.rx.clone();
-//         let pred = self.pred.clone();
-//         async move {
-//             if (pred)(rx.borrow_and_update().as_ref()) {
-//                 return;
-//             }
-//             while rx.changed().await.is_ok() {
-//                 if (pred)(rx.borrow().as_ref()) {
-//                     break;
-//                 }
-//             }
-//         }
-//         .boxed()
-//     }
-// }
-
 // Fires with exponential backoff (stateful)
 struct BackoffTrigger {
     base: Duration,
@@ -163,10 +140,7 @@ impl Trigger for AllOf {
 }
 type TickFn = for<'a> fn(&'a mut WsState) -> UserFuture<'a>;
 
-fn make_factory(
-    trig: Trig,
-    tick: TickFn,
-) -> Arc<dyn Fn() -> BoxFuture<'static, TickFn> + Send + Sync> {
+fn make_factory(trig: Trig, tick: TickFn) -> Factory {
     Arc::new(move || {
         let trig = trig.clone();
         async move {
@@ -244,7 +218,7 @@ async fn run_ws_loop<Data>(
     handler: impl Fn(&mut WsState, &Message) -> Result<HandlerOutcome<Data>> + Send + Sync + 'static,
     data_sink: impl Fn(Data) + Send + Sync + 'static,
 
-    mut user_future_factories: Vec<Arc<dyn Fn() -> BoxFuture<'static, TickFn> + Send + Sync>>,
+    user_future_factories: Vec<Factory>,
 ) -> Result<()>
 where
     Data: Send + 'static,
