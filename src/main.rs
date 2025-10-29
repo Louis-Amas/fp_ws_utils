@@ -1,7 +1,11 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
-use std::time::{Duration, Instant};
+use std::{
+    future::Future,
+    pin::Pin,
+    time::{Duration, Instant},
+};
 use tokio::{net::TcpStream, time};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
@@ -21,9 +25,26 @@ enum HandlerOutcome<Data> {
 type Handler<Data> = fn(&mut WsState, &Message) -> Result<HandlerOutcome<Data>>;
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-/// Core websocket loop where user_future_factory runs inside select!
-/// and when it resolves, it immediately executes its returned closure.
-async fn run_ws_loop<Data, UFut, UFutOuter>(
+// ---- HRTB-friendly types ----
+type UserFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+type UserTick = dyn for<'a> FnOnce(&'a mut WsState) -> UserFuture<'a> + Send + Sync;
+
+// ---- KEY: a named generic function is HRTB-coercible; closures are not ----
+fn user_tick_fn<'a>(state: &'a mut WsState) -> UserFuture<'a> {
+    Box::pin(async move {
+        // freely read/mutate `state` across awaits
+        let before = state.connected;
+        time::sleep(Duration::from_secs(1)).await;
+        state.connected = before; // example mutation
+        println!(
+            "⏰ periodic check — connected={} last_msg={}",
+            state.connected, state.last_msg
+        );
+    })
+}
+
+/// Core websocket loop; factory is selected concurrently and executed immediately.
+async fn run_ws_loop<Data, UFutOuter>(
     url: String,
     mut state: WsState,
     on_reconnect: impl Fn(&mut WsState, &mut WsStream) + Send + Sync + 'static,
@@ -33,9 +54,7 @@ async fn run_ws_loop<Data, UFut, UFutOuter>(
 ) -> Result<()>
 where
     Data: Send + 'static,
-    UFut: std::future::Future<Output = ()> + Send + 'static,
-    UFutOuter: std::future::Future<Output = Box<dyn for<'a> FnOnce(&'a mut WsState) -> UFut + Send + Sync>>
-        + Send,
+    UFutOuter: Future<Output = Box<UserTick>> + Send + 'static,
 {
     loop {
         println!("🔌 Connecting to {url}...");
@@ -68,7 +87,7 @@ where
                             HandlerOutcome::Reconnect => {
                                 println!("🔁 Reconnection requested by handler");
                                 state.connected = false;
-                                break;
+                                break; // reconnect
                             }
                             HandlerOutcome::Stop => {
                                 println!("🛑 Handler requested stop");
@@ -77,19 +96,18 @@ where
                         },
                         Some(Err(e)) => {
                             eprintln!("WebSocket error: {e}");
-                            break;
+                            break; // reconnect
                         }
                         None => {
                             eprintln!("🔕 Stream closed by server");
-                            break;
+                            break; // reconnect
                         }
                     }
                 }
 
-                // --- User future factory resolved ---
-                closure = user_future_factory() => {
-                    println!("⚙️ user_future_factory resolved — executing inner user future");
-                    let fut = closure(&mut state);
+                // --- Factory resolves inside select; immediately run the inner async with &mut state ---
+                tick_closure = user_future_factory() => {
+                    let fut = tick_closure(&mut state);
                     fut.await;
                 }
             }
@@ -103,8 +121,8 @@ where
 
 fn text_logger(state: &mut WsState, msg: &Message) -> Result<HandlerOutcome<String>> {
     if let Message::Text(txt) = msg {
-        state.last_msg = Utc::now();
         println!("📜 Received text: {txt}");
+        state.last_msg = Utc::now();
     }
     Ok(HandlerOutcome::Continue(None))
 }
@@ -157,22 +175,11 @@ async fn main() -> Result<()> {
 
     let combined_handler = chain_handlers(vec![pong_updater, reconnect_on_keyword, text_logger]);
 
-    // Outer async factory that returns a closure
     let user_future_factory = || async {
         println!("⚙️ Outer async factory building...");
         time::sleep(Duration::from_secs(1)).await;
 
-        Box::new(|state: &mut WsState| {
-            let connected = state.connected;
-            let last_msg = state.last_msg;
-            async move {
-                time::sleep(Duration::from_secs(1)).await;
-                println!(
-                    "⏰ periodic check — connected={} last_msg={}",
-                    connected, last_msg
-                );
-            }
-        }) as Box<dyn for<'a> FnOnce(&'a mut WsState) -> _ + Send + Sync>
+        Box::new(user_tick_fn) as Box<UserTick>
     };
 
     run_ws_loop(
@@ -185,3 +192,4 @@ async fn main() -> Result<()> {
     )
     .await
 }
+
