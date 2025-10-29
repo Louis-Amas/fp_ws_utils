@@ -1,9 +1,11 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use futures::StreamExt;
+use futures::stream::FuturesUnordered;
+use futures::{FutureExt, StreamExt, future::BoxFuture};
 use std::{
     future::Future,
     pin::Pin,
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{net::TcpStream, time};
@@ -29,12 +31,11 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type UserFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 type UserTick = dyn for<'a> FnOnce(&'a mut WsState) -> UserFuture<'a> + Send + Sync;
 
-// ---- KEY: a named generic function is HRTB-coercible; closures are not ----
+// ---- Named generic function for the inner async tick (HRTB-coercible) ----
 fn user_tick_fn<'a>(state: &'a mut WsState) -> UserFuture<'a> {
     Box::pin(async move {
         // freely read/mutate `state` across awaits
         let before = state.connected;
-        time::sleep(Duration::from_secs(1)).await;
         state.connected = before; // example mutation
         println!(
             "⏰ periodic check — connected={} last_msg={}",
@@ -43,18 +44,34 @@ fn user_tick_fn<'a>(state: &'a mut WsState) -> UserFuture<'a> {
     })
 }
 
-/// Core websocket loop; factory is selected concurrently and executed immediately.
-async fn run_ws_loop<Data, UFutOuter>(
+fn user_tick_fn_2<'a>(state: &'a mut WsState) -> UserFuture<'a> {
+    Box::pin(async move {
+        // freely read/mutate `state` across awaits
+        let before = state.connected;
+        state.connected = before; // example mutation
+        println!(
+            "⏰ periodic check 2 — connected={} last_msg={}",
+            state.connected, state.last_msg
+        );
+    })
+}
+
+/// Core websocket loop; *multiple* factories are selected concurrently and executed immediately.
+async fn run_ws_loop<Data>(
     url: String,
     mut state: WsState,
     on_reconnect: impl Fn(&mut WsState, &mut WsStream) + Send + Sync + 'static,
     handler: impl Fn(&mut WsState, &Message) -> Result<HandlerOutcome<Data>> + Send + Sync + 'static,
     data_sink: impl Fn(Data) + Send + Sync + 'static,
-    user_future_factory: impl Fn() -> UFutOuter + Send + Sync + 'static + Clone,
+
+    // Vec of factories. Each factory returns a BoxFuture that yields a Box<UserTick>.
+    // Use Arc so we can re-arm (clone) it after each fire.
+    mut user_future_factories: Vec<
+        Arc<dyn Fn() -> BoxFuture<'static, Box<UserTick>> + Send + Sync>,
+    >,
 ) -> Result<()>
 where
     Data: Send + 'static,
-    UFutOuter: Future<Output = Box<UserTick>> + Send + 'static,
 {
     loop {
         println!("🔌 Connecting to {url}...");
@@ -72,6 +89,15 @@ where
         on_reconnect(&mut state, &mut stream);
         println!("✅ Connected!");
 
+        // Build a FuturesUnordered of (idx, Box<UserTick>), one pending per factory
+        let mut pending: FuturesUnordered<BoxFuture<'static, (usize, Box<UserTick>)>> =
+            FuturesUnordered::new();
+
+        for (i, f) in user_future_factories.iter().enumerate() {
+            let f = Arc::clone(f);
+            pending.push(async move { (i, f().await) }.boxed());
+        }
+
         loop {
             tokio::select! {
                 // --- WebSocket message received ---
@@ -87,7 +113,7 @@ where
                             HandlerOutcome::Reconnect => {
                                 println!("🔁 Reconnection requested by handler");
                                 state.connected = false;
-                                break; // reconnect
+                                break; // reconnect outer loop
                             }
                             HandlerOutcome::Stop => {
                                 println!("🛑 Handler requested stop");
@@ -96,19 +122,34 @@ where
                         },
                         Some(Err(e)) => {
                             eprintln!("WebSocket error: {e}");
-                            break; // reconnect
+                            break; // reconnect outer loop
                         }
                         None => {
                             eprintln!("🔕 Stream closed by server");
-                            break; // reconnect
+                            break; // reconnect outer loop
                         }
                     }
                 }
 
-                // --- Factory resolves inside select; immediately run the inner async with &mut state ---
-                tick_closure = user_future_factory() => {
-                    let fut = tick_closure(&mut state);
-                    fut.await;
+                // --- Any factory resolves; run its inner user future immediately, then re-arm that factory ---
+                maybe_item = pending.next() => {
+                    match maybe_item {
+                        Some((idx, tick_closure)) => {
+                            // Execute the user tick now
+                            let fut = tick_closure(&mut state);
+                            fut.await;
+
+                            // Re-arm the SAME factory by pushing a fresh future back
+                            if let Some(factory) = user_future_factories.get(idx).cloned() {
+                                pending.push(async move { (idx, factory().await) }.boxed());
+                            }
+                        }
+                        None => {
+                            // No more factories (empty). If you want to keep running, you can re-seed here.
+                            // For now, just idle a bit to avoid a tight loop.
+                            time::sleep(Duration::from_millis(50)).await;
+                        }
+                    }
                 }
             }
         }
@@ -175,12 +216,26 @@ async fn main() -> Result<()> {
 
     let combined_handler = chain_handlers(vec![pong_updater, reconnect_on_keyword, text_logger]);
 
-    let user_future_factory = || async {
-        println!("⚙️ Outer async factory building...");
-        time::sleep(Duration::from_secs(1)).await;
+    // Example: build multiple factories with different cadences
+    let f1: Arc<dyn Fn() -> BoxFuture<'static, Box<UserTick>> + Send + Sync> = Arc::new(|| {
+        async {
+            // outer async preparation for f1
+            time::sleep(Duration::from_millis(400)).await;
+            Box::new(user_tick_fn) as Box<UserTick>
+        }
+        .boxed()
+    });
 
-        Box::new(user_tick_fn) as Box<UserTick>
-    };
+    let f2: Arc<dyn Fn() -> BoxFuture<'static, Box<UserTick>> + Send + Sync> = Arc::new(|| {
+        async {
+            // outer async preparation for f2
+            time::sleep(Duration::from_millis(900)).await;
+            Box::new(user_tick_fn_2) as Box<UserTick>
+        }
+        .boxed()
+    });
+
+    let factories = vec![f1, f2];
 
     run_ws_loop(
         "ws://localhost:1234".to_string(),
@@ -188,8 +243,7 @@ async fn main() -> Result<()> {
         on_reconnect,
         combined_handler,
         |msg| println!("📩 Data: {msg}"),
-        user_future_factory,
+        factories,
     )
     .await
 }
-
