@@ -257,7 +257,11 @@ make_handler_chain! {
     text_logger
 }
 
-pub fn on_reconnect(_state: &mut WsState, _stream: &mut WsStream) {
+pub fn on_reconnect<S, I>(state: &mut S, _stream: &mut WsStream)
+where
+    S: Selector<Conn, I>,
+{
+    state.get_mut().connected = true
     // Resubscribe or send hello here if needed
 }
 
@@ -303,4 +307,3 @@ async fn main() -> Result<()> {
     )
     .await
 }
-
