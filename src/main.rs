@@ -54,16 +54,11 @@ enum HandlerOutcome<Data> {
     Stop,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 enum Msg {
+    #[default]
     TestA,
     TestB,
-}
-
-impl Default for Msg {
-    fn default() -> Self {
-        Self::TestA
-    }
 }
 
 type Handler<S, Data> = fn(&mut S, &Message) -> Result<HandlerOutcome<Data>>;
@@ -132,6 +127,7 @@ impl<M: Clone + Send + 'static + Default> Trigger<M> for BroadcastTrigger<M> {
     fn arm(&self) -> BoxFuture<'static, M> {
         let mut rx = self.tx.subscribe();
         async move {
+            // FIXME: remove unwrap
             let m = rx.recv().await.unwrap();
             m
         }
