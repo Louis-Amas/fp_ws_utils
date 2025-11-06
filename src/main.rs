@@ -1,5 +1,6 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use frunk::{HCons, HNil, hlist};
 use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt};
 use std::{
@@ -11,14 +12,39 @@ use std::{
 use tokio::sync::{Notify, broadcast, watch};
 use tokio::time::sleep;
 use tokio::{net::TcpStream, time};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message}; // brings `get` / `get_mut` into scope
 
-// ---------- Core types ----------
 #[derive(Clone, Debug)]
-struct WsState {
-    connected: bool,
-    last_pong: Instant,
-    last_msg: DateTime<Utc>,
+pub struct LastMsg {
+    pub last_msg: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Heartbeat {
+    pub last_pong: Instant,
+    pub last_msg: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Conn {
+    pub connected: bool,
+}
+
+// If you add more components, they just become more HList elements.
+pub type WsState = HCons<LastMsg, HCons<Heartbeat, HCons<Conn, HNil>>>;
+
+// Helper to build initial HList state
+fn make_state() -> WsState {
+    hlist![
+        LastMsg {
+            last_msg: Utc::now(),
+        },
+        Heartbeat {
+            last_pong: Instant::now(),
+            last_msg: Utc::now()
+        },
+        Conn { connected: false },
+    ]
 }
 
 enum HandlerOutcome<Data> {
@@ -32,11 +58,11 @@ enum TestMsg {
     TestB,
 }
 
-type Handler<Data> = fn(&mut WsState, &Message) -> Result<HandlerOutcome<Data>>;
+type Handler<S, Data> = fn(&mut S, &Message) -> Result<HandlerOutcome<Data>>;
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-type TickFn = for<'a> fn(&'a mut WsStream, &'a mut WsState, TestMsg) -> UserFuture<'a>;
-type Factory = Arc<dyn Fn() -> BoxFuture<'static, (TickFn, TestMsg)> + Send + Sync>;
+type TickFn<S> = for<'a> fn(&'a mut WsStream, &'a mut S, TestMsg) -> UserFuture<'a>;
+type Factory<S> = Arc<dyn Fn() -> BoxFuture<'static, (TickFn<S>, TestMsg)> + Send + Sync>;
 
 // ---- HRTB- types for user ticks ----
 type UserFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
@@ -128,7 +154,7 @@ impl Trigger for BackoffTrigger {
     }
 }
 
-fn make_factory(trig: Trig, tick: TickFn) -> Factory {
+fn make_factory<S: 'static>(trig: Trig, tick: TickFn<S>) -> Factory<S> {
     Arc::new(move || {
         let trig = trig.clone();
         async move {
@@ -140,10 +166,10 @@ fn make_factory(trig: Trig, tick: TickFn) -> Factory {
 }
 
 // ---------- Handler chaining ----------
-fn chain_handlers<Data: 'static>(
-    handlers: Vec<Handler<Data>>,
-) -> impl Fn(&mut WsState, &Message) -> Result<HandlerOutcome<Data>> {
-    move |state: &mut WsState, msg: &Message| {
+fn chain_handlers<S: 'static, Data: 'static>(
+    handlers: Vec<Handler<S, Data>>,
+) -> impl Fn(&mut S, &Message) -> Result<HandlerOutcome<Data>> {
+    move |state: &mut S, msg: &Message| {
         for handler in &handlers {
             match handler(state, msg)? {
                 HandlerOutcome::Continue(maybe) => {
@@ -163,50 +189,46 @@ fn chain_handlers<Data: 'static>(
 fn text_logger(state: &mut WsState, msg: &Message) -> Result<HandlerOutcome<String>> {
     if let Message::Text(txt) = msg {
         println!("📜 Received text: {txt}");
-        state.last_msg = Utc::now();
+        let last: &mut LastMsg = state.get_mut();
+        last.last_msg = Utc::now();
     }
     Ok(HandlerOutcome::Continue(None))
 }
 
 fn pong_updater(state: &mut WsState, msg: &Message) -> Result<HandlerOutcome<String>> {
     if matches!(msg, Message::Pong(_)) {
-        state.last_pong = Instant::now();
+        // Borrow the Heartbeat substate by its type
+        let hb: &mut Heartbeat = state.get_mut();
+        hb.last_pong = Instant::now();
     }
     Ok(HandlerOutcome::Continue(None))
 }
 
 fn reconnect_on_keyword(_state: &mut WsState, msg: &Message) -> Result<HandlerOutcome<String>> {
-    if let Message::Text(t) = msg {
-        if t.as_str() == "reconnect" {
-            println!("🔁 reconnect requested via message");
-            return Ok(HandlerOutcome::Reconnect);
-        }
+    if let Message::Text(t) = msg
+        && t.as_str() == "reconnect"
+    {
+        println!("🔁 reconnect requested via message");
+        return Ok(HandlerOutcome::Reconnect);
     }
     Ok(HandlerOutcome::Continue(None))
 }
 
-// ---------- Example ticks ----------
-async fn user_tick_1(state: &mut WsState) {
-    println!(
-        "tick1: connected={} last_msg={}",
-        state.connected, state.last_msg
-    );
-}
-
 async fn user_tick_2(state: &mut WsState, msg: TestMsg) {
     time::sleep(Duration::from_millis(150)).await;
-    println!("tick2: heavy work done; last_pong={:?}", state.last_pong);
+    let bo: &LastMsg = state.get_mut();
+    println!("tick2: heavy work done; last_msg={:?}", bo.last_msg);
 }
 
 // ---------- Core ws loop ----------
-async fn run_ws_loop<Data>(
+async fn run_ws_loop<S: 'static, Data>(
     url: String,
-    mut state: WsState,
-    on_reconnect: impl Fn(&mut WsState, &mut WsStream) + Send + Sync + 'static,
-    handler: impl Fn(&mut WsState, &Message) -> Result<HandlerOutcome<Data>> + Send + Sync + 'static,
+    mut state: S,
+    on_reconnect: impl Fn(&mut S, &mut WsStream) + Send + Sync + 'static,
+    handler: impl Fn(&mut S, &Message) -> Result<HandlerOutcome<Data>> + Send + Sync + 'static,
     data_sink: impl Fn(Data) + Send + Sync + 'static,
 
-    user_future_factories: Vec<Factory>,
+    user_future_factories: Vec<Factory<S>>,
 ) -> Result<()>
 where
     Data: Send + 'static,
@@ -224,11 +246,10 @@ where
             }
         };
 
-        state.connected = true;
         on_reconnect(&mut state, &mut stream);
         println!("✅ Connected!");
 
-        let mut pending: FuturesUnordered<BoxFuture<'static, (usize, TickFn, TestMsg)>> =
+        let mut pending: FuturesUnordered<BoxFuture<'static, (usize, TickFn<S>, TestMsg)>> =
             FuturesUnordered::new();
         for (i, f) in user_future_factories.iter().enumerate() {
             let f = Arc::clone(f);
@@ -248,10 +269,9 @@ where
                     match maybe {
                         Some(Ok(msg)) => match handler(&mut state, &msg)? {
                             HandlerOutcome::Continue(maybe_data) => {
-                                state.last_msg = Utc::now();
                                 if let Some(d) = maybe_data { data_sink(d); }
                             }
-                            HandlerOutcome::Reconnect => { println!("🔁 reconnect requested by handler"); state.connected = false; break; }
+                            HandlerOutcome::Reconnect => { println!("🔁 reconnect requested by handler"); break; }
                             HandlerOutcome::Stop => { println!("🛑 stop requested by handler"); return Ok(()); }
                         },
                         Some(Err(e)) => { eprintln!("ws error: {e}"); break; }
@@ -278,7 +298,6 @@ where
                 }
             }
         }
-        state.connected = false;
         println!("⚠️ connection lost, retrying in 2s…");
         time::sleep(Duration::from_secs(2)).await;
     }
@@ -287,17 +306,10 @@ where
 // ---------- Demo main ----------
 #[tokio::main]
 async fn main() -> Result<()> {
-    // --- shared “last activity” for a watch-trigger demo
     let (last_activity_tx, last_activity_rx) = watch::channel::<Instant>(Instant::now());
 
-    // --- initial state
-    let state = WsState {
-        connected: false,
-        last_pong: Instant::now(),
-        last_msg: Utc::now(),
-    };
+    let state = make_state();
 
-    // --- handlers (update watch when message arrives)
     let combined_handler = {
         let inner = chain_handlers(vec![pong_updater, reconnect_on_keyword, text_logger]);
         move |s: &mut WsState, msg: &Message| {
@@ -307,56 +319,19 @@ async fn main() -> Result<()> {
         }
     };
 
-    // --- triggers
-    let periodic_2s: Trig = Arc::new(IntervalTrigger {
-        period: Duration::from_secs(2),
-    });
-
     let notify = Arc::new(Notify::new());
     let on_notify: Trig = Arc::new(NotifyTrigger {
         notify: notify.clone(),
     });
 
     let (sig_tx, _sig_rx0) = broadcast::channel::<()>(64);
-    let on_signal: Trig = Arc::new(BroadcastTrigger { tx: sig_tx.clone() });
 
-    // fires when idle ≥ 3s
-    // let idle_3s: Trig = Arc::new(WatchTrigger {
-    //     rx: last_activity_rx.clone(),
-    //     pred: Arc::new(|last: &Instant| last.elapsed() >= Duration::from_secs(3)),
-    // });
-
-    // exponential backoff starting at 200ms up to 5s
-    let backoff: Trig = Arc::new(BackoffTrigger {
-        base: Duration::from_millis(200),
-        max: Duration::from_secs(5),
-        state: Mutex::new(Duration::from_millis(200)),
-    });
-
-    // // combine: run when idle ≥3s AND backoff finishes
-    // let idle_then_backoff: Trig = Arc::new(AllOf {
-    //     a: idle_3s.clone(),
-    //     b: backoff.clone(),
-    // });
-
-    // or: either periodic 2s OR manual signal
-    // let periodic_or_signal: Trig = Arc::new(AnyOf {
-    //     a: periodic_2s.clone(),
-    //     b: on_signal.clone(),
-    // });
-
-    // --- build user ticks as factories
-    // let f1 = make_factory(periodic_or_signal.clone(), |s, msg| {
-    //     Box::pin(user_tick_1(s))
-    // });
     let f2 = make_factory(on_notify.clone(), |stream, s, msg| {
         Box::pin(user_tick_2(s, msg))
     });
-    // let f3 = make_factory(idle_then_backoff.clone(), |s| Box::pin(user_tick_2(s)));
 
     let factories = vec![f2];
 
-    // --- demo: produce some signals in background
     // every 5s, broadcast a signal
     let sig_tx_clone = sig_tx.clone();
     tokio::spawn(async move {
@@ -373,10 +348,9 @@ async fn main() -> Result<()> {
         notify_clone.notify_one();
     });
 
-    // --- run
     // Use any echo websocket or your own server. For local testing, change the URL accordingly.
-    run_ws_loop::<String>(
-        "wss://echo.websocket.events".to_string(), // or "ws://localhost:1234"
+    run_ws_loop::<WsState, String>(
+        "ws://localhost:1234".to_string(),
         state,
         |_state: &mut WsState, _stream: &mut WsStream| {
             // (re)subscribe, send hello, etc.
