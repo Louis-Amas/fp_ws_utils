@@ -35,7 +35,7 @@ enum TestMsg {
 type Handler<Data> = fn(&mut WsState, &Message) -> Result<HandlerOutcome<Data>>;
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-type TickFn = for<'a> fn(&'a mut WsState, TestMsg) -> UserFuture<'a>;
+type TickFn = for<'a> fn(&'a mut WsStream, &'a mut WsState, TestMsg) -> UserFuture<'a>;
 type Factory = Arc<dyn Fn() -> BoxFuture<'static, (TickFn, TestMsg)> + Send + Sync>;
 
 // ---- HRTB- types for user ticks ----
@@ -262,7 +262,7 @@ where
                 item = pending.next() => {
                     match item {
                         Some((idx, tick, tmsg)) => {
-                            (tick)(&mut state, tmsg).await;
+                            (tick)(&mut stream, &mut state, tmsg).await;
                             if let Some(factory) = user_future_factories.get(idx).cloned() {
                                 pending.push(async move {
                                     let (tck, tmsg2) = factory().await;
@@ -349,7 +349,9 @@ async fn main() -> Result<()> {
     // let f1 = make_factory(periodic_or_signal.clone(), |s, msg| {
     //     Box::pin(user_tick_1(s))
     // });
-    let f2 = make_factory(on_notify.clone(), |s, msg| Box::pin(user_tick_2(s, msg)));
+    let f2 = make_factory(on_notify.clone(), |stream, s, msg| {
+        Box::pin(user_tick_2(s, msg))
+    });
     // let f3 = make_factory(idle_then_backoff.clone(), |s| Box::pin(user_tick_2(s)));
 
     let factories = vec![f2];
