@@ -177,7 +177,6 @@ macro_rules! make_ws_loop {
             url: String,
             state: $StateTy:ty,
             handler: $handler:path,
-            data_sink: $sink:path,
             on_reconnect: $on_reconnect:path
         );
         $(
@@ -219,11 +218,7 @@ macro_rules! make_ws_loop {
                             maybe = stream.next() => {
                                 match maybe {
                                     Some(Ok(msg)) => match $handler(&mut state, &msg)? {
-                                        HandlerOutcome::Continue(maybe_data) => {
-                                            if let Some(d) = maybe_data {
-                                                $sink(d);
-                                            }
-                                        }
+                                        HandlerOutcome::Continue(_maybe_data) => {}
                                         HandlerOutcome::Reconnect => {
                                             println!("🔁 reconnect requested by handler");
                                             break;
@@ -262,11 +257,6 @@ make_handler_chain! {
     text_logger
 }
 
-// ---------- Helper hooks ----------
-pub fn print_data(d: String) {
-    println!("📩 data: {d}");
-}
-
 pub fn on_reconnect(_state: &mut WsState, _stream: &mut WsStream) {
     // Resubscribe or send hello here if needed
 }
@@ -276,7 +266,6 @@ make_ws_loop! {
         url: String,
         state: WsState,
         handler: combined_handler,
-        data_sink: print_data,
         on_reconnect: on_reconnect
     );
     broadcast_arm: { msg_ty: String };
@@ -288,9 +277,7 @@ make_ws_loop! {
 async fn main() -> Result<()> {
     let state = make_state();
 
-    // --- Broadcast trigger + tick fn ---
     let (tx, _rx0) = broadcast::channel::<String>(64);
-    // simulate broadcast every second
     let tx_clone = tx.clone();
     tokio::spawn(async move {
         loop {
@@ -300,7 +287,6 @@ async fn main() -> Result<()> {
     });
 
     let broadcast_trigger: Arc<dyn Trigger<String>> = Arc::new(BroadcastTrigger { tx });
-    // NOTE: with HRTB Tick, returning a non-'static boxed future is fine now
     let broadcast_tick: Tick<String> = Arc::new(|ws, st, m| Box::pin(tick_broadcast(ws, st, m)));
 
     // --- Interval trigger + tick fn ---
@@ -317,3 +303,4 @@ async fn main() -> Result<()> {
     )
     .await
 }
+
