@@ -1,5 +1,6 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use frunk::hlist::Selector;
 use frunk::{HCons, HNil, hlist};
 use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt};
@@ -186,7 +187,10 @@ fn chain_handlers<S: 'static, Data: 'static>(
 }
 
 // ---------- Example handlers ----------
-fn text_logger(state: &mut WsState, msg: &Message) -> Result<HandlerOutcome<String>> {
+fn text_logger<S, I>(state: &mut S, msg: &Message) -> Result<HandlerOutcome<String>>
+where
+    S: Selector<LastMsg, I>,
+{
     if let Message::Text(txt) = msg {
         println!("📜 Received text: {txt}");
         let last: &mut LastMsg = state.get_mut();
@@ -195,7 +199,10 @@ fn text_logger(state: &mut WsState, msg: &Message) -> Result<HandlerOutcome<Stri
     Ok(HandlerOutcome::Continue(None))
 }
 
-fn pong_updater(state: &mut WsState, msg: &Message) -> Result<HandlerOutcome<String>> {
+fn pong_updater<S, I>(state: &mut S, msg: &Message) -> Result<HandlerOutcome<String>>
+where
+    S: Selector<Heartbeat, I>,
+{
     if matches!(msg, Message::Pong(_)) {
         // Borrow the Heartbeat substate by its type
         let hb: &mut Heartbeat = state.get_mut();
@@ -215,7 +222,6 @@ fn reconnect_on_keyword(_state: &mut WsState, msg: &Message) -> Result<HandlerOu
 }
 
 async fn user_tick_2(state: &mut WsState, msg: TestMsg) {
-    time::sleep(Duration::from_millis(150)).await;
     let bo: &LastMsg = state.get_mut();
     println!("tick2: heavy work done; last_msg={:?}", bo.last_msg);
 }
@@ -326,7 +332,9 @@ async fn main() -> Result<()> {
 
     let (sig_tx, _sig_rx0) = broadcast::channel::<()>(64);
 
-    let f2 = make_factory(on_notify.clone(), |stream, s, msg| {
+    let broadcast = Arc::new(BroadcastTrigger { tx: sig_tx.clone() });
+
+    let f2 = make_factory(broadcast.clone(), |stream, s, msg| {
         Box::pin(user_tick_2(s, msg))
     });
 
@@ -336,17 +344,17 @@ async fn main() -> Result<()> {
     let sig_tx_clone = sig_tx.clone();
     tokio::spawn(async move {
         loop {
-            time::sleep(Duration::from_secs(5)).await;
+            time::sleep(Duration::from_secs(1)).await;
             let _ = sig_tx_clone.send(());
         }
     });
 
     // after 7s, fire the notify once
-    let notify_clone = notify.clone();
-    tokio::spawn(async move {
-        time::sleep(Duration::from_secs(7)).await;
-        notify_clone.notify_one();
-    });
+    // let notify_clone = notify.clone();
+    // tokio::spawn(async move {
+    //     time::sleep(Duration::from_secs(7)).await;
+    //     notify_clone.notify_one();
+    // });
 
     // Use any echo websocket or your own server. For local testing, change the URL accordingly.
     run_ws_loop::<WsState, String>(
