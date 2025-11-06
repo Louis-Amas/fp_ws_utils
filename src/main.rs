@@ -54,16 +54,23 @@ enum HandlerOutcome<Data> {
     Stop,
 }
 
-enum TestMsg {
+#[derive(Debug, Clone)]
+enum Msg {
     TestA,
     TestB,
+}
+
+impl Default for Msg {
+    fn default() -> Self {
+        Self::TestA
+    }
 }
 
 type Handler<S, Data> = fn(&mut S, &Message) -> Result<HandlerOutcome<Data>>;
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-type TickFn<S> = for<'a> fn(&'a mut WsStream, &'a mut S, TestMsg) -> UserFuture<'a>;
-type Factory<S> = Arc<dyn Fn() -> BoxFuture<'static, (TickFn<S>, TestMsg)> + Send + Sync>;
+type TickFn<S, M> = for<'a> fn(&'a mut WsStream, &'a mut S, M) -> UserFuture<'a>;
+type Factory<S, M> = Arc<dyn Fn() -> BoxFuture<'static, (TickFn<S, M>, M)> + Send + Sync>;
 
 // ---- HRTB- types for user ticks ----
 type UserFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
@@ -80,22 +87,22 @@ macro_rules! user_async_adapter {
 }
 
 // ---------- Triggers ----------
-trait Trigger: Send + Sync {
-    fn arm(&self) -> BoxFuture<'static, TestMsg>;
+trait Trigger<M: Default>: Send + Sync {
+    fn arm(&self) -> BoxFuture<'static, M>;
 }
-type Trig = Arc<dyn Trigger>;
+type Trig<M: Default> = Arc<dyn Trigger<M>>;
 
 // Fires every fixed interval
 struct IntervalTrigger {
     period: Duration,
 }
-impl Trigger for IntervalTrigger {
-    fn arm(&self) -> BoxFuture<'static, TestMsg> {
+impl<M: Default> Trigger<M> for IntervalTrigger {
+    fn arm(&self) -> BoxFuture<'static, M> {
         let d = self.period;
         async move {
             sleep(d).await;
 
-            TestMsg::TestA
+            M::default()
         }
         .boxed()
     }
@@ -105,13 +112,13 @@ impl Trigger for IntervalTrigger {
 struct NotifyTrigger {
     notify: Arc<Notify>,
 }
-impl Trigger for NotifyTrigger {
-    fn arm(&self) -> BoxFuture<'static, TestMsg> {
+impl<M: Default> Trigger<M> for NotifyTrigger {
+    fn arm(&self) -> BoxFuture<'static, M> {
         let n = self.notify.clone();
         async move {
             n.notified().await;
 
-            TestMsg::TestA
+            M::default()
         }
         .boxed()
     }
@@ -121,46 +128,26 @@ impl Trigger for NotifyTrigger {
 struct BroadcastTrigger<T: Clone + Send + 'static> {
     tx: broadcast::Sender<T>,
 }
-impl<T: Clone + Send + 'static> Trigger for BroadcastTrigger<T> {
-    fn arm(&self) -> BoxFuture<'static, TestMsg> {
+impl<M: Clone + Send + 'static + Default> Trigger<M> for BroadcastTrigger<M> {
+    fn arm(&self) -> BoxFuture<'static, M> {
         let mut rx = self.tx.subscribe();
         async move {
-            let _ = rx.recv().await;
-
-            TestMsg::TestA
+            let m = rx.recv().await.unwrap();
+            m
         }
         .boxed()
     }
 }
 
-// Fires with exponential backoff (stateful)
-struct BackoffTrigger {
-    base: Duration,
-    max: Duration,
-    state: Mutex<Duration>,
-}
-impl Trigger for BackoffTrigger {
-    fn arm(&self) -> BoxFuture<'static, TestMsg> {
-        let delay = {
-            let mut s = self.state.lock().unwrap();
-            let current = (*s).max(self.base);
-            *s = (current * 2).min(self.max);
-            current
-        };
-        async move {
-            sleep(delay).await;
-            TestMsg::TestA
-        }
-        .boxed()
-    }
-}
-
-fn make_factory<S: 'static>(trig: Trig, tick: TickFn<S>) -> Factory<S> {
+fn make_factory<S: 'static, M: 'static + Default>(
+    trig: Trig<M>,
+    tick: TickFn<S, M>,
+) -> Factory<S, M> {
     Arc::new(move || {
         let trig = trig.clone();
         async move {
-            trig.arm().await;
-            (tick, TestMsg::TestA)
+            let msg = trig.arm().await;
+            (tick, msg)
         }
         .boxed()
     })
@@ -221,20 +208,20 @@ fn reconnect_on_keyword(_state: &mut WsState, msg: &Message) -> Result<HandlerOu
     Ok(HandlerOutcome::Continue(None))
 }
 
-async fn user_tick_2(state: &mut WsState, msg: TestMsg) {
+async fn user_tick_2(state: &mut WsState, msg: Msg) {
     let bo: &LastMsg = state.get_mut();
     println!("tick2: heavy work done; last_msg={:?}", bo.last_msg);
 }
 
 // ---------- Core ws loop ----------
-async fn run_ws_loop<S: 'static, Data>(
+async fn run_ws_loop<S: 'static, Data, M: 'static>(
     url: String,
     mut state: S,
     on_reconnect: impl Fn(&mut S, &mut WsStream) + Send + Sync + 'static,
     handler: impl Fn(&mut S, &Message) -> Result<HandlerOutcome<Data>> + Send + Sync + 'static,
     data_sink: impl Fn(Data) + Send + Sync + 'static,
 
-    user_future_factories: Vec<Factory<S>>,
+    user_future_factories: Vec<Factory<S, M>>,
 ) -> Result<()>
 where
     Data: Send + 'static,
@@ -255,7 +242,7 @@ where
         on_reconnect(&mut state, &mut stream);
         println!("✅ Connected!");
 
-        let mut pending: FuturesUnordered<BoxFuture<'static, (usize, TickFn<S>, TestMsg)>> =
+        let mut pending: FuturesUnordered<BoxFuture<'static, (usize, TickFn<S, M>, M)>> =
             FuturesUnordered::new();
         for (i, f) in user_future_factories.iter().enumerate() {
             let f = Arc::clone(f);
@@ -326,15 +313,15 @@ async fn main() -> Result<()> {
     };
 
     let notify = Arc::new(Notify::new());
-    let on_notify: Trig = Arc::new(NotifyTrigger {
+    let on_notify: Trig<Msg> = Arc::new(NotifyTrigger {
         notify: notify.clone(),
     });
 
-    let (sig_tx, _sig_rx0) = broadcast::channel::<()>(64);
+    let (sig_tx, _sig_rx0) = broadcast::channel::<Msg>(64);
 
     let broadcast = Arc::new(BroadcastTrigger { tx: sig_tx.clone() });
 
-    let f2 = make_factory(broadcast.clone(), |stream, s, msg| {
+    let f2 = make_factory::<_, Msg>(broadcast.clone(), |stream, s, msg| {
         Box::pin(user_tick_2(s, msg))
     });
 
@@ -345,7 +332,7 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         loop {
             time::sleep(Duration::from_secs(1)).await;
-            let _ = sig_tx_clone.send(());
+            let _ = sig_tx_clone.send(Msg::TestA);
         }
     });
 
@@ -357,7 +344,7 @@ async fn main() -> Result<()> {
     // });
 
     // Use any echo websocket or your own server. For local testing, change the URL accordingly.
-    run_ws_loop::<WsState, String>(
+    run_ws_loop::<WsState, String, Msg>(
         "ws://localhost:1234".to_string(),
         state,
         |_state: &mut WsState, _stream: &mut WsStream| {
