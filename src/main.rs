@@ -2,18 +2,18 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use frunk::hlist::Selector;
 use frunk::{HCons, HNil, hlist};
-use futures::FutureExt;
-use futures::StreamExt;
 use futures::future::BoxFuture;
+use futures::{FutureExt, StreamExt};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::{Notify, broadcast, watch};
+use tokio::sync::{Notify, broadcast};
 use tokio::time::sleep;
 use tokio::{net::TcpStream, time};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message}; // ← NEW
 
+// ---------- State structs ----------
 #[derive(Clone, Debug)]
 pub struct LastMsg {
     pub last_msg: DateTime<Utc>,
@@ -30,14 +30,12 @@ pub struct Conn {
     pub connected: bool,
 }
 
-// If you add more components, they just become more HList elements.
 pub type WsState = HCons<LastMsg, HCons<Heartbeat, HCons<Conn, HNil>>>;
 
-// Helper to build initial HList state
 fn make_state() -> WsState {
     hlist![
         LastMsg {
-            last_msg: Utc::now(),
+            last_msg: Utc::now()
         },
         Heartbeat {
             last_pong: Instant::now(),
@@ -56,11 +54,11 @@ enum HandlerOutcome<Data> {
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+// ---------- Trigger trait ----------
 trait Trigger<M: Default>: Send + Sync {
     fn arm(&self) -> BoxFuture<'static, M>;
 }
 
-// Fires every fixed interval
 struct IntervalTrigger {
     period: Duration,
 }
@@ -75,7 +73,6 @@ impl<M: Default> Trigger<M> for IntervalTrigger {
     }
 }
 
-// Fires when someone calls `notify.notify_one()` or `notify_waiters()`
 struct NotifyTrigger {
     notify: Arc<Notify>,
 }
@@ -90,20 +87,17 @@ impl<M: Default> Trigger<M> for NotifyTrigger {
     }
 }
 
-// Fires when a broadcast message is published (each arming gets its own Rx)
 struct BroadcastTrigger<T: Clone + Send + 'static> {
     tx: broadcast::Sender<T>,
 }
 impl<M: Clone + Send + 'static + Default> Trigger<M> for BroadcastTrigger<M> {
     fn arm(&self) -> BoxFuture<'static, M> {
         let mut rx = self.tx.subscribe();
-
-        // FIXME: DO not unwrap
         async move { rx.recv().await.unwrap_or_default() }.boxed()
     }
 }
 
-// ---------- Handler helpers (real functions) ----------
+// ---------- Handler helpers ----------
 fn text_logger<S, I>(state: &mut S, msg: &Message) -> Result<HandlerOutcome<String>>
 where
     S: Selector<LastMsg, I>,
@@ -137,19 +131,25 @@ fn reconnect_on_keyword(_state: &mut WsState, msg: &Message) -> Result<HandlerOu
     Ok(HandlerOutcome::Continue(None))
 }
 
+// ---------- Tick functions ----------
 #[derive(Clone, Default)]
-struct Beat; // example: periodic heartbeat tick
+struct Beat;
 
 async fn tick_broadcast(_ws: &mut WsStream, state: &mut WsState, m: String) {
-    let bo: &LastMsg = state.get_mut();
-    println!("tick_broadcast: last_msg={:?} msg={m}", bo.last_msg);
+    let last = state.get_mut::<LastMsg, _>(); // &mut LastMsg is fine for read
+    println!("tick_broadcast: last_msg={:?} msg={m}", last.last_msg);
 }
 
 async fn tick_heartbeat(_ws: &mut WsStream, state: &mut WsState, _m: Beat) {
-    let hb: &Heartbeat = state.get_mut();
+    let hb = state.get_mut::<Heartbeat, _>();
     println!("tick_heartbeat: last_pong={:?}", hb.last_pong);
 }
 
+// ---------- Tick type (FIXED: HRTB over lifetimes) ----------
+type Tick<M> =
+    Arc<dyn for<'a> Fn(&'a mut WsStream, &'a mut WsState, M) -> BoxFuture<'a, ()> + Send + Sync>;
+
+// ---------- Handler chain macro ----------
 #[macro_export]
 macro_rules! make_handler_chain {
     (
@@ -170,7 +170,6 @@ macro_rules! make_handler_chain {
     }
 }
 
-// ---------- Generate a run loop with one arm per factory ----------
 #[macro_export]
 macro_rules! make_ws_loop {
     (
@@ -182,16 +181,15 @@ macro_rules! make_ws_loop {
             on_reconnect: $on_reconnect:path
         );
         $(
-            $arm_name:ident : {
-                trig: $trig_expr:expr,
-                msg_ty: $MsgTy:ty,
-                tick_fn: $tick_fn:path
-            }
+            $arm_name:ident : { msg_ty: $MsgTy:ty }
         );+ $(;)?
     ) => {
         async fn $fname(
             url: String,
             mut state: $StateTy,
+            $(
+                $arm_name: (Arc<dyn Trigger<$MsgTy>>, Tick<$MsgTy>),
+            )+
         ) -> anyhow::Result<()> {
             loop {
                 println!("🔌 Connecting to {url}...");
@@ -204,39 +202,48 @@ macro_rules! make_ws_loop {
                     }
                 };
 
-                // user-defined reconnect hook
                 $on_reconnect(&mut state, &mut stream);
                 println!("✅ Connected!");
 
-                // arm each trigger once
-                $(
-                    let mut $arm_name : futures::future::BoxFuture<'static, $MsgTy> = ($trig_expr).arm();
-                )+
+                paste::paste! {
+                    $(
+                        let ([<trig_ $arm_name>], [<tick_ $arm_name>]) = $arm_name.clone();
+                        let mut [<fut_ $arm_name>] = [<trig_ $arm_name>].arm();
+                    )+
+                }
 
                 loop {
-                    tokio::select! {
-                        maybe = stream.next() => {
-                            match maybe {
-                                Some(Ok(msg)) => match $handler(&mut state, &msg)? {
-                                    HandlerOutcome::Continue(maybe_data) => {
-                                        if let Some(d) = maybe_data { $sink(d); }
-                                    }
-                                    HandlerOutcome::Reconnect => { println!("🔁 reconnect requested by handler"); break; }
-                                    HandlerOutcome::Stop => { println!("🛑 stop requested by handler"); return Ok(()); }
+                    // run paste outside so select! sees plain arms
+                    paste::paste! {
+                        tokio::select! {
+                            maybe = stream.next() => {
+                                match maybe {
+                                    Some(Ok(msg)) => match $handler(&mut state, &msg)? {
+                                        HandlerOutcome::Continue(maybe_data) => {
+                                            if let Some(d) = maybe_data {
+                                                $sink(d);
+                                            }
+                                        }
+                                        HandlerOutcome::Reconnect => {
+                                            println!("🔁 reconnect requested by handler");
+                                            break;
+                                        }
+                                        HandlerOutcome::Stop => {
+                                            println!("🛑 stop requested by handler");
+                                            return Ok(());
+                                        }
+                                    },
+                                    Some(Err(e)) => { eprintln!("ws error: {e}"); break; }
+                                    None => { eprintln!("🔕 stream closed"); break; }
+                                }
+                            },
+                            $(
+                                m = &mut [<fut_ $arm_name>] => {
+                                    ([<tick_ $arm_name>])(&mut stream, &mut state, m).await;
+                                    [<fut_ $arm_name>] = [<trig_ $arm_name>].arm();
                                 },
-                                Some(Err(e)) => { eprintln!("ws error: {e}"); break; }
-                                None => { eprintln!("🔕 stream closed"); break; }
-                            }
+                            )+
                         }
-
-                        $(
-                            m = &mut $arm_name => {
-                                // run the real tick function
-                                $tick_fn(&mut stream, &mut state, m).await;
-                                // re-arm
-                                $arm_name = ($trig_expr).arm();
-                            }
-                        )+
                     }
                 }
 
@@ -247,6 +254,7 @@ macro_rules! make_ws_loop {
     };
 }
 
+// ---------- Handler chain ----------
 make_handler_chain! {
     fn combined_handler<WsState, String>();
     pong_updater,
@@ -254,17 +262,15 @@ make_handler_chain! {
     text_logger
 }
 
-// Example sink (real function)
+// ---------- Helper hooks ----------
 pub fn print_data(d: String) {
     println!("📩 data: {d}");
 }
 
-// Example reconnect hook (real function)
 pub fn on_reconnect(_state: &mut WsState, _stream: &mut WsStream) {
-    // (re)subscribe, send hello, etc.
+    // Resubscribe or send hello here if needed
 }
 
-// ---------- Build the ws loop with strongly-typed arms ----------
 make_ws_loop! {
     fn run_ws_loop(
         url: String,
@@ -273,40 +279,41 @@ make_ws_loop! {
         data_sink: print_data,
         on_reconnect: on_reconnect
     );
-    // Each arm is: { trigger expr, message type, tick function (real fn path) }
-    broadcast_arm: {
-        trig: {
-            // Broadcast<Sig>
-            let (sig_tx, _rx0) = broadcast::channel::<String>(64);
-            // demo: broadcast every second
-            let tx_clone = sig_tx.clone();
-            tokio::spawn(async move {
-                loop {
-                    time::sleep(Duration::from_secs(1)).await;
-                    let _ = tx_clone.send("bo".to_string());
-                }
-            });
-            Arc::new(BroadcastTrigger { tx: sig_tx }) as Arc<dyn Trigger<String>>
-        },
-        msg_ty: String,
-        tick_fn: crate::tick_broadcast
-    };
-    heartbeat_arm: {
-        trig: {
-            // Fixed interval Beat
-            Arc::new(IntervalTrigger { period: Duration::from_secs(3) }) as Arc<dyn Trigger<Beat>>
-        },
-        msg_ty: Beat,
-        tick_fn: crate::tick_heartbeat
-    };
+    broadcast_arm: { msg_ty: String };
+    heartbeat_arm: { msg_ty: Beat };
 }
 
 // ---------- Demo main ----------
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _activity = watch::channel::<Instant>(Instant::now()); // keep if you want to wire activity separately
     let state = make_state();
 
-    // Use any echo websocket or your own server. For local testing, change the URL accordingly.
-    run_ws_loop("ws://localhost:1234".to_string(), state).await
+    // --- Broadcast trigger + tick fn ---
+    let (tx, _rx0) = broadcast::channel::<String>(64);
+    // simulate broadcast every second
+    let tx_clone = tx.clone();
+    tokio::spawn(async move {
+        loop {
+            time::sleep(Duration::from_secs(1)).await;
+            let _ = tx_clone.send("bo".to_string());
+        }
+    });
+
+    let broadcast_trigger: Arc<dyn Trigger<String>> = Arc::new(BroadcastTrigger { tx });
+    // NOTE: with HRTB Tick, returning a non-'static boxed future is fine now
+    let broadcast_tick: Tick<String> = Arc::new(|ws, st, m| Box::pin(tick_broadcast(ws, st, m)));
+
+    // --- Interval trigger + tick fn ---
+    let heartbeat_trigger: Arc<dyn Trigger<Beat>> = Arc::new(IntervalTrigger {
+        period: Duration::from_secs(3),
+    });
+    let heartbeat_tick: Tick<Beat> = Arc::new(|ws, st, m| Box::pin(tick_heartbeat(ws, st, m)));
+
+    run_ws_loop(
+        "ws://localhost:1234".to_string(),
+        state,
+        (broadcast_trigger, broadcast_tick),
+        (heartbeat_trigger, heartbeat_tick),
+    )
+    .await
 }
