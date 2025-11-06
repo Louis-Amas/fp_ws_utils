@@ -2,18 +2,17 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use frunk::hlist::Selector;
 use frunk::{HCons, HNil, hlist};
+use futures::FutureExt;
+use futures::StreamExt;
 use futures::future::BoxFuture;
-use futures::{FutureExt, StreamExt};
 use std::{
-    future::Future,
-    pin::Pin,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::sync::{Notify, broadcast, watch};
 use tokio::time::sleep;
 use tokio::{net::TcpStream, time};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message}; // brings `get` / `get_mut` into scope
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
 #[derive(Clone, Debug)]
 pub struct LastMsg {
@@ -48,44 +47,18 @@ fn make_state() -> WsState {
     ]
 }
 
+// ---------- Core handler outcome ----------
 enum HandlerOutcome<Data> {
     Continue(Option<Data>),
     Reconnect,
     Stop,
 }
 
-#[derive(Debug, Clone, Default)]
-enum Msg {
-    #[default]
-    TestA,
-    TestB,
-}
-
-type Handler<S, Data> = fn(&mut S, &Message) -> Result<HandlerOutcome<Data>>;
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-type TickFn<S, M> = for<'a> fn(&'a mut WsStream, &'a mut S, M) -> UserFuture<'a>;
-type Factory<S, M> = Arc<dyn Fn() -> BoxFuture<'static, (TickFn<S, M>, M)> + Send + Sync>;
-
-// ---- HRTB- types for user ticks ----
-type UserFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
-
-// Adapter macro for async fn(&mut WsState) -> impl Future<Output=()>
-#[macro_export]
-macro_rules! user_async_adapter {
-    ($f:path) => {{
-        fn __adapter<'a>(s: &'a mut WsState) -> UserFuture<'a> {
-            Box::pin($f(s))
-        }
-        __adapter
-    }};
-}
-
-// ---------- Triggers ----------
 trait Trigger<M: Default>: Send + Sync {
     fn arm(&self) -> BoxFuture<'static, M>;
 }
-type Trig<M: Default> = Arc<dyn Trigger<M>>;
 
 // Fires every fixed interval
 struct IntervalTrigger {
@@ -96,7 +69,6 @@ impl<M: Default> Trigger<M> for IntervalTrigger {
         let d = self.period;
         async move {
             sleep(d).await;
-
             M::default()
         }
         .boxed()
@@ -112,7 +84,6 @@ impl<M: Default> Trigger<M> for NotifyTrigger {
         let n = self.notify.clone();
         async move {
             n.notified().await;
-
             M::default()
         }
         .boxed()
@@ -126,50 +97,13 @@ struct BroadcastTrigger<T: Clone + Send + 'static> {
 impl<M: Clone + Send + 'static + Default> Trigger<M> for BroadcastTrigger<M> {
     fn arm(&self) -> BoxFuture<'static, M> {
         let mut rx = self.tx.subscribe();
-        async move {
-            // FIXME: remove unwrap
-            let m = rx.recv().await.unwrap();
-            m
-        }
-        .boxed()
+
+        // FIXME: DO not unwrap
+        async move { rx.recv().await.unwrap_or_default() }.boxed()
     }
 }
 
-fn make_factory<S: 'static, M: 'static + Default>(
-    trig: Trig<M>,
-    tick: TickFn<S, M>,
-) -> Factory<S, M> {
-    Arc::new(move || {
-        let trig = trig.clone();
-        async move {
-            let msg = trig.arm().await;
-            (tick, msg)
-        }
-        .boxed()
-    })
-}
-
-// ---------- Handler chaining ----------
-fn chain_handlers<S: 'static, Data: 'static>(
-    handlers: Vec<Handler<S, Data>>,
-) -> impl Fn(&mut S, &Message) -> Result<HandlerOutcome<Data>> {
-    move |state: &mut S, msg: &Message| {
-        for handler in &handlers {
-            match handler(state, msg)? {
-                HandlerOutcome::Continue(maybe) => {
-                    if maybe.is_some() {
-                        return Ok(HandlerOutcome::Continue(maybe));
-                    }
-                }
-                HandlerOutcome::Reconnect => return Ok(HandlerOutcome::Reconnect),
-                HandlerOutcome::Stop => return Ok(HandlerOutcome::Stop),
-            }
-        }
-        Ok(HandlerOutcome::Continue(None))
-    }
-}
-
-// ---------- Example handlers ----------
+// ---------- Handler helpers (real functions) ----------
 fn text_logger<S, I>(state: &mut S, msg: &Message) -> Result<HandlerOutcome<String>>
 where
     S: Selector<LastMsg, I>,
@@ -187,7 +121,6 @@ where
     S: Selector<Heartbeat, I>,
 {
     if matches!(msg, Message::Pong(_)) {
-        // Borrow the Heartbeat substate by its type
         let hb: &mut Heartbeat = state.get_mut();
         hb.last_pong = Instant::now();
     }
@@ -204,151 +137,176 @@ fn reconnect_on_keyword(_state: &mut WsState, msg: &Message) -> Result<HandlerOu
     Ok(HandlerOutcome::Continue(None))
 }
 
-async fn user_tick_2(state: &mut WsState, msg: Msg) {
+#[derive(Clone, Default)]
+struct Beat; // example: periodic heartbeat tick
+
+async fn tick_broadcast(_ws: &mut WsStream, state: &mut WsState, m: String) {
     let bo: &LastMsg = state.get_mut();
-    println!("tick2: heavy work done; last_msg={:?}", bo.last_msg);
+    println!("tick_broadcast: last_msg={:?} msg={m}", bo.last_msg);
 }
 
-// ---------- Core ws loop ----------
-async fn run_ws_loop<S: 'static, Data, M: 'static>(
-    url: String,
-    mut state: S,
-    on_reconnect: impl Fn(&mut S, &mut WsStream) + Send + Sync + 'static,
-    handler: impl Fn(&mut S, &Message) -> Result<HandlerOutcome<Data>> + Send + Sync + 'static,
-    data_sink: impl Fn(Data) + Send + Sync + 'static,
+async fn tick_heartbeat(_ws: &mut WsStream, state: &mut WsState, _m: Beat) {
+    let hb: &Heartbeat = state.get_mut();
+    println!("tick_heartbeat: last_pong={:?}", hb.last_pong);
+}
 
-    user_future_factories: Vec<Factory<S, M>>,
-) -> Result<()>
-where
-    Data: Send + 'static,
-{
-    use futures::stream::FuturesUnordered;
-
-    loop {
-        println!("🔌 Connecting to {url}...");
-        let (mut stream, _) = match connect_async(&url).await {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("Connection failed: {e}, retrying in 2s…");
-                time::sleep(Duration::from_secs(2)).await;
-                continue;
-            }
-        };
-
-        on_reconnect(&mut state, &mut stream);
-        println!("✅ Connected!");
-
-        let mut pending: FuturesUnordered<BoxFuture<'static, (usize, TickFn<S, M>, M)>> =
-            FuturesUnordered::new();
-        for (i, f) in user_future_factories.iter().enumerate() {
-            let f = Arc::clone(f);
-            pending.push(
-                async move {
-                    let (tick, tmsg) = f().await;
-                    (i, tick, tmsg)
+#[macro_export]
+macro_rules! make_handler_chain {
+    (
+        fn $fname:ident < $StateTy:ty, $DataTy:ty > ();
+        $($handler:path),+ $(,)?
+    ) => {
+        fn $fname(state: &mut $StateTy, msg: &Message) -> anyhow::Result<HandlerOutcome<$DataTy>> {
+            $(
+                match $handler(state, msg)? {
+                    HandlerOutcome::Continue(Some(d)) => return Ok(HandlerOutcome::Continue(Some(d))),
+                    HandlerOutcome::Continue(None) => { /* keep going */ }
+                    HandlerOutcome::Reconnect => return Ok(HandlerOutcome::Reconnect),
+                    HandlerOutcome::Stop => return Ok(HandlerOutcome::Stop),
                 }
-                .boxed(),
-            );
+            )+
+            Ok(HandlerOutcome::Continue(None))
         }
-
-        loop {
-            tokio::select! {
-                // WS message
-                maybe = stream.next() => {
-                    match maybe {
-                        Some(Ok(msg)) => match handler(&mut state, &msg)? {
-                            HandlerOutcome::Continue(maybe_data) => {
-                                if let Some(d) = maybe_data { data_sink(d); }
-                            }
-                            HandlerOutcome::Reconnect => { println!("🔁 reconnect requested by handler"); break; }
-                            HandlerOutcome::Stop => { println!("🛑 stop requested by handler"); return Ok(()); }
-                        },
-                        Some(Err(e)) => { eprintln!("ws error: {e}"); break; }
-                        None => { eprintln!("🔕 stream closed"); break; }
-                    }
-                }
-                // Any factory became ready: run its tick, then re-arm the same factory
-                item = pending.next() => {
-                    match item {
-                        Some((idx, tick, tmsg)) => {
-                            (tick)(&mut stream, &mut state, tmsg).await;
-                            if let Some(factory) = user_future_factories.get(idx).cloned() {
-                                pending.push(async move {
-                                    let (tck, tmsg2) = factory().await;
-                                    (idx, tck, tmsg2)
-                                }.boxed());
-                            }
-                        }
-                        None => {
-                            // no factories armed; small idle
-                            time::sleep(Duration::from_millis(50)).await;
-                        }
-                    }
-                }
-            }
-        }
-        println!("⚠️ connection lost, retrying in 2s…");
-        time::sleep(Duration::from_secs(2)).await;
     }
+}
+
+// ---------- Generate a run loop with one arm per factory ----------
+#[macro_export]
+macro_rules! make_ws_loop {
+    (
+        fn $fname:ident (
+            url: String,
+            state: $StateTy:ty,
+            handler: $handler:path,
+            data_sink: $sink:path,
+            on_reconnect: $on_reconnect:path
+        );
+        $(
+            $arm_name:ident : {
+                trig: $trig_expr:expr,
+                msg_ty: $MsgTy:ty,
+                tick_fn: $tick_fn:path
+            }
+        );+ $(;)?
+    ) => {
+        async fn $fname(
+            url: String,
+            mut state: $StateTy,
+        ) -> anyhow::Result<()> {
+            loop {
+                println!("🔌 Connecting to {url}...");
+                let (mut stream, _) = match connect_async(&url).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("Connection failed: {e}, retrying in 2s…");
+                        time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                };
+
+                // user-defined reconnect hook
+                $on_reconnect(&mut state, &mut stream);
+                println!("✅ Connected!");
+
+                // arm each trigger once
+                $(
+                    let mut $arm_name : futures::future::BoxFuture<'static, $MsgTy> = ($trig_expr).arm();
+                )+
+
+                loop {
+                    tokio::select! {
+                        maybe = stream.next() => {
+                            match maybe {
+                                Some(Ok(msg)) => match $handler(&mut state, &msg)? {
+                                    HandlerOutcome::Continue(maybe_data) => {
+                                        if let Some(d) = maybe_data { $sink(d); }
+                                    }
+                                    HandlerOutcome::Reconnect => { println!("🔁 reconnect requested by handler"); break; }
+                                    HandlerOutcome::Stop => { println!("🛑 stop requested by handler"); return Ok(()); }
+                                },
+                                Some(Err(e)) => { eprintln!("ws error: {e}"); break; }
+                                None => { eprintln!("🔕 stream closed"); break; }
+                            }
+                        }
+
+                        $(
+                            m = &mut $arm_name => {
+                                // run the real tick function
+                                $tick_fn(&mut stream, &mut state, m).await;
+                                // re-arm
+                                $arm_name = ($trig_expr).arm();
+                            }
+                        )+
+                    }
+                }
+
+                println!("⚠️ connection lost, retrying in 2s…");
+                time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    };
+}
+
+make_handler_chain! {
+    fn combined_handler<WsState, String>();
+    pong_updater,
+    reconnect_on_keyword,
+    text_logger
+}
+
+// Example sink (real function)
+pub fn print_data(d: String) {
+    println!("📩 data: {d}");
+}
+
+// Example reconnect hook (real function)
+pub fn on_reconnect(_state: &mut WsState, _stream: &mut WsStream) {
+    // (re)subscribe, send hello, etc.
+}
+
+// ---------- Build the ws loop with strongly-typed arms ----------
+make_ws_loop! {
+    fn run_ws_loop(
+        url: String,
+        state: WsState,
+        handler: combined_handler,
+        data_sink: print_data,
+        on_reconnect: on_reconnect
+    );
+    // Each arm is: { trigger expr, message type, tick function (real fn path) }
+    broadcast_arm: {
+        trig: {
+            // Broadcast<Sig>
+            let (sig_tx, _rx0) = broadcast::channel::<String>(64);
+            // demo: broadcast every second
+            let tx_clone = sig_tx.clone();
+            tokio::spawn(async move {
+                loop {
+                    time::sleep(Duration::from_secs(1)).await;
+                    let _ = tx_clone.send("bo".to_string());
+                }
+            });
+            Arc::new(BroadcastTrigger { tx: sig_tx }) as Arc<dyn Trigger<String>>
+        },
+        msg_ty: String,
+        tick_fn: crate::tick_broadcast
+    };
+    heartbeat_arm: {
+        trig: {
+            // Fixed interval Beat
+            Arc::new(IntervalTrigger { period: Duration::from_secs(3) }) as Arc<dyn Trigger<Beat>>
+        },
+        msg_ty: Beat,
+        tick_fn: crate::tick_heartbeat
+    };
 }
 
 // ---------- Demo main ----------
 #[tokio::main]
 async fn main() -> Result<()> {
-    let (last_activity_tx, last_activity_rx) = watch::channel::<Instant>(Instant::now());
-
+    let _activity = watch::channel::<Instant>(Instant::now()); // keep if you want to wire activity separately
     let state = make_state();
 
-    let combined_handler = {
-        let inner = chain_handlers(vec![pong_updater, reconnect_on_keyword, text_logger]);
-        move |s: &mut WsState, msg: &Message| {
-            // update "activity" clock on any message
-            let _ = last_activity_tx.send(Instant::now());
-            inner(s, msg)
-        }
-    };
-
-    let notify = Arc::new(Notify::new());
-    let on_notify: Trig<Msg> = Arc::new(NotifyTrigger {
-        notify: notify.clone(),
-    });
-
-    let (sig_tx, _sig_rx0) = broadcast::channel::<Msg>(64);
-
-    let broadcast = Arc::new(BroadcastTrigger { tx: sig_tx.clone() });
-
-    let f2 = make_factory::<_, Msg>(broadcast.clone(), |stream, s, msg| {
-        Box::pin(user_tick_2(s, msg))
-    });
-
-    let factories = vec![f2];
-
-    // every 5s, broadcast a signal
-    let sig_tx_clone = sig_tx.clone();
-    tokio::spawn(async move {
-        loop {
-            time::sleep(Duration::from_secs(1)).await;
-            let _ = sig_tx_clone.send(Msg::TestA);
-        }
-    });
-
-    // after 7s, fire the notify once
-    // let notify_clone = notify.clone();
-    // tokio::spawn(async move {
-    //     time::sleep(Duration::from_secs(7)).await;
-    //     notify_clone.notify_one();
-    // });
-
     // Use any echo websocket or your own server. For local testing, change the URL accordingly.
-    run_ws_loop::<WsState, String, Msg>(
-        "ws://localhost:1234".to_string(),
-        state,
-        |_state: &mut WsState, _stream: &mut WsStream| {
-            // (re)subscribe, send hello, etc.
-        },
-        combined_handler,
-        |data| println!("📩 data: {data}"),
-        factories,
-    )
-    .await
+    run_ws_loop("ws://localhost:1234".to_string(), state).await
 }
