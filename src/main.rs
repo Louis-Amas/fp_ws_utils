@@ -11,7 +11,7 @@ use std::{
 use tokio::sync::{Notify, broadcast};
 use tokio::time::sleep;
 use tokio::{net::TcpStream, time};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message}; // ← NEW
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
 // ---------- State structs ----------
 #[derive(Clone, Debug)]
@@ -46,8 +46,8 @@ fn make_state() -> WsState {
 }
 
 // ---------- Core handler outcome ----------
-enum HandlerOutcome<Data> {
-    Continue(Option<Data>),
+enum HandlerOutcome {
+    Continue,
     Reconnect,
     Stop,
 }
@@ -98,7 +98,7 @@ impl<M: Clone + Send + 'static + Default> Trigger<M> for BroadcastTrigger<M> {
 }
 
 // ---------- Handler helpers ----------
-fn text_logger<S, I>(state: &mut S, msg: &Message) -> Result<HandlerOutcome<String>>
+fn text_logger<S, I>(state: &mut S, msg: &Message) -> Result<HandlerOutcome>
 where
     S: Selector<LastMsg, I>,
 {
@@ -107,10 +107,10 @@ where
         let last: &mut LastMsg = state.get_mut();
         last.last_msg = Utc::now();
     }
-    Ok(HandlerOutcome::Continue(None))
+    Ok(HandlerOutcome::Continue)
 }
 
-fn pong_updater<S, I>(state: &mut S, msg: &Message) -> Result<HandlerOutcome<String>>
+fn pong_updater<S, I>(state: &mut S, msg: &Message) -> Result<HandlerOutcome>
 where
     S: Selector<Heartbeat, I>,
 {
@@ -118,17 +118,17 @@ where
         let hb: &mut Heartbeat = state.get_mut();
         hb.last_pong = Instant::now();
     }
-    Ok(HandlerOutcome::Continue(None))
+    Ok(HandlerOutcome::Continue)
 }
 
-fn reconnect_on_keyword(_state: &mut WsState, msg: &Message) -> Result<HandlerOutcome<String>> {
+fn reconnect_on_keyword(_state: &mut WsState, msg: &Message) -> Result<HandlerOutcome> {
     if let Message::Text(t) = msg
         && t.as_str() == "reconnect"
     {
         println!("🔁 reconnect requested via message");
         return Ok(HandlerOutcome::Reconnect);
     }
-    Ok(HandlerOutcome::Continue(None))
+    Ok(HandlerOutcome::Continue)
 }
 
 // ---------- Tick functions ----------
@@ -156,16 +156,15 @@ macro_rules! make_handler_chain {
         fn $fname:ident < $StateTy:ty, $DataTy:ty > ();
         $($handler:path),+ $(,)?
     ) => {
-        fn $fname(state: &mut $StateTy, msg: &Message) -> anyhow::Result<HandlerOutcome<$DataTy>> {
+        fn $fname(state: &mut $StateTy, msg: &Message) -> anyhow::Result<HandlerOutcome> {
             $(
                 match $handler(state, msg)? {
-                    HandlerOutcome::Continue(Some(d)) => return Ok(HandlerOutcome::Continue(Some(d))),
-                    HandlerOutcome::Continue(None) => { /* keep going */ }
+                    HandlerOutcome::Continue => { /* keep going */ }
                     HandlerOutcome::Reconnect => return Ok(HandlerOutcome::Reconnect),
                     HandlerOutcome::Stop => return Ok(HandlerOutcome::Stop),
                 }
             )+
-            Ok(HandlerOutcome::Continue(None))
+            Ok(HandlerOutcome::Continue)
         }
     }
 }
@@ -218,7 +217,7 @@ macro_rules! make_ws_loop {
                             maybe = stream.next() => {
                                 match maybe {
                                     Some(Ok(msg)) => match $handler(&mut state, &msg)? {
-                                        HandlerOutcome::Continue(_maybe_data) => {}
+                                        HandlerOutcome::Continue => {}
                                         HandlerOutcome::Reconnect => {
                                             println!("🔁 reconnect requested by handler");
                                             break;
