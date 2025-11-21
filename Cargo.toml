@@ -3,6 +3,14 @@ name = "rust_ws"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "rust_ws"
+path = "src/lib.rs"
+
+[[example]]
+name = "simple_bot"
+path = "examples/simple_bot.rs"
+
 [dependencies]
 anyhow = "1.0.100"
 chrono = "0.4.42"
