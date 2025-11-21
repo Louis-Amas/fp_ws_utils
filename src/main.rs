@@ -1,17 +1,25 @@
 use anyhow::Result;
-use frunk::hlist;
+use frunk::{HCons, HNil, hlist};
 use futures::FutureExt;
+use futures::SinkExt;
 use futures::StreamExt;
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::time::sleep;
-use futures::SinkExt;
 use tokio_tungstenite::tungstenite::Message;
 
 // Import from the library (assuming package name is 'rust_ws')
-use rust_ws::state::{make_state, WsState, LastMsg, Heartbeat};
 use rust_ws::engine::{bind_stream, run_ws_loop};
-use rust_ws::app::{log_text, update_pong};
+use rust_ws::modules::heartbeat::{Heartbeat, update_pong};
+use rust_ws::modules::logging::{LastMsg, log_text};
+use rust_ws::state::Conn;
+
+// Define WsState here in main
+pub type WsState = HCons<LastMsg, HCons<Heartbeat, HCons<Conn, HNil>>>;
+
+fn make_state() -> WsState {
+    hlist![LastMsg::default(), Heartbeat::default(), Conn::default(),]
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -43,7 +51,8 @@ async fn main() -> Result<()> {
         println!("📢 Broadcast: {msg} (Last WS msg: {:?})", last.last_msg);
         async move {
             let _ = ws.send(Message::Text(msg.into())).await;
-        }.boxed()
+        }
+        .boxed()
     });
 
     let stream2 = bind_stream(heartbeat_stream, |_, state: &mut WsState, _instant| {
