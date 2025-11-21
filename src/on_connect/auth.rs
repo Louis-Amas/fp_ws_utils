@@ -13,10 +13,7 @@ pub struct AuthState {
 }
 
 // This is an Action, not a Handler, because it triggers the auth
-pub fn send_auth<'a, S, I>(
-    ws: &'a mut WsStream,
-    state: &'a mut S,
-) -> BoxFuture<'a, ()>
+pub fn send_auth<'a, S, I>(ws: &'a mut WsStream, state: &'a mut S) -> BoxFuture<'a, ()>
 where
     S: Selector<AuthState, I> + Send + 'static,
 {

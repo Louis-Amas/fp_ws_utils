@@ -3,11 +3,11 @@ use frunk::{HCons, HNil, hlist};
 use rust_ws::{
     engine::run_ws_loop,
     handler::to_handler,
-    modules::{
+    handlers::{
         logging::{LastMsg, log_text},
         ping_pong::{PingState, handle_ping_pong},
-        subscription::{SubscriptionState, send_subscriptions},
     },
+    on_connect::subscription::{SubscriptionState, send_subscriptions},
     state::Conn,
     types::ConnectHandler,
 };

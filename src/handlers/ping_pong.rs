@@ -53,10 +53,7 @@ where
 }
 
 // This function checks if we timed out
-pub fn check_timeout<'a, S, I>(
-    _ws: &'a mut WsStream,
-    state: &'a mut S,
-) -> BoxFuture<'a, ()>
+pub fn check_timeout<'a, S, I>(_ws: &'a mut WsStream, state: &'a mut S) -> BoxFuture<'a, ()>
 where
     S: Selector<PingState, I> + Send + 'static,
 {

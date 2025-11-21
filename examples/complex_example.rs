@@ -5,12 +5,14 @@ use frunk::{HCons, HNil, hlist};
 use rust_ws::{
     engine::{bind_stream, run_ws_loop},
     handler::to_handler,
-    modules::{
-        auth::{AuthState, send_auth},
+    handlers::{
         forwarder::{ForwarderState, forward_messages},
         heartbeat::{Heartbeat, update_pong},
         logging::{LastMsg, log_text},
         ping_pong::{PingState, check_timeout, handle_ping_pong},
+    },
+    on_connect::{
+        auth::{AuthState, send_auth},
         subscription::{SubscriptionState, send_subscriptions},
     },
     state::Conn,
