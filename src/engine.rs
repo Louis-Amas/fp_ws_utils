@@ -1,13 +1,18 @@
+use std::{sync::Arc, time::Duration};
+
 use anyhow::Result;
-use futures::StreamExt;
-use futures::future::BoxFuture;
-use futures::stream::{BoxStream, SelectAll};
-use std::sync::Arc;
-use std::time::Duration;
+use futures::{
+    StreamExt,
+    future::BoxFuture,
+    stream::{BoxStream, SelectAll},
+};
 use tokio::time::sleep;
 use tokio_tungstenite::connect_async;
-use crate::types::{Action, HandlerOutcome, WsStream};
-use crate::handler::WsHandler;
+
+use crate::{
+    handler::WsHandler,
+    types::{Action, HandlerOutcome, WsStream},
+};
 
 pub fn bind_stream<S, M, St, F>(stream: St, logic: F) -> BoxStream<'static, Action<S>>
 where

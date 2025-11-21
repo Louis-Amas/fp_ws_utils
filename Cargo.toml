@@ -8,8 +8,12 @@ name = "rust_ws"
 path = "src/lib.rs"
 
 [[example]]
-name = "simple_bot"
-path = "examples/simple_bot.rs"
+name = "simple_example"
+path = "examples/simple_example.rs"
+
+[[example]]
+name = "complex_example"
+path = "examples/complex_example.rs"
 
 [dependencies]
 anyhow = "1.0.100"

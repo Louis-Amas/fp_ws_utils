@@ -1,9 +1,11 @@
+use std::time::Instant;
+
 use anyhow::Result;
 use frunk::hlist::Selector;
-use std::time::Instant;
-use tokio_tungstenite::tungstenite::Message;
-use crate::types::{HandlerOutcome, WsStream};
 use futures::future::{BoxFuture, FutureExt};
+use tokio_tungstenite::tungstenite::Message;
+
+use crate::types::{HandlerOutcome, WsStream};
 
 #[derive(Clone, Debug)]
 pub struct Heartbeat {
@@ -18,7 +20,11 @@ impl Default for Heartbeat {
     }
 }
 
-pub fn update_pong<'a, S, I>(_ws: &'a mut WsStream, state: &'a mut S, msg: &'a Message) -> BoxFuture<'a, Result<HandlerOutcome>>
+pub fn update_pong<'a, S, I>(
+    _ws: &'a mut WsStream,
+    state: &'a mut S,
+    msg: &'a Message,
+) -> BoxFuture<'a, Result<HandlerOutcome>>
 where
     S: Selector<Heartbeat, I> + Send + 'static,
 {
@@ -28,5 +34,6 @@ where
             hb.last_pong = Instant::now();
         }
         Ok(HandlerOutcome::Continue)
-    }.boxed()
+    }
+    .boxed()
 }

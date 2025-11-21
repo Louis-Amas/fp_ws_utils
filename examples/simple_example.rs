@@ -1,18 +1,19 @@
+use std::time::Duration;
+
 use anyhow::Result;
 use frunk::{HCons, HNil, hlist};
-use futures::FutureExt;
-use futures::SinkExt;
-use futures::StreamExt;
-use std::time::Duration;
-use tokio::sync::broadcast;
-use tokio::time::sleep;
-use tokio_tungstenite::tungstenite::Message;
-
+use futures::{FutureExt, SinkExt, StreamExt};
 // Import from the library (assuming package name is 'rust_ws')
 use rust_ws::engine::{bind_stream, run_ws_loop};
-use rust_ws::modules::heartbeat::{Heartbeat, update_pong};
-use rust_ws::modules::logging::{LastMsg, log_text};
-use rust_ws::state::Conn;
+use rust_ws::{
+    modules::{
+        heartbeat::{Heartbeat, update_pong},
+        logging::{LastMsg, log_text},
+    },
+    state::Conn,
+};
+use tokio::{sync::broadcast, time::sleep};
+use tokio_tungstenite::tungstenite::Message;
 
 // Define WsState here in main
 pub type WsState = HCons<LastMsg, HCons<Heartbeat, HCons<Conn, HNil>>>;
