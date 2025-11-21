@@ -8,13 +8,7 @@ use crate::types::{HandlerOutcome, WsStream};
 
 #[derive(Clone, Debug)]
 pub struct ForwarderState<T> {
-    pub sender: Option<UnboundedSender<T>>,
-}
-
-impl<T> Default for ForwarderState<T> {
-    fn default() -> Self {
-        Self { sender: None }
-    }
+    pub sender: UnboundedSender<T>,
 }
 
 pub trait MessageParser<T> {
@@ -36,9 +30,7 @@ where
     async move {
         if let Some(parsed) = parser.parse(msg) {
             let fwd_state: &mut ForwarderState<T> = state.get_mut();
-            if let Some(tx) = &fwd_state.sender {
-                let _ = tx.send(parsed);
-            }
+            let _ = fwd_state.sender.send(parsed);
         }
         Ok(HandlerOutcome::Continue)
     }

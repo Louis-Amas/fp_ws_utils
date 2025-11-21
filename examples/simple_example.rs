@@ -70,6 +70,7 @@ async fn main() -> Result<()> {
     run_ws_loop(
         "ws://localhost:1234".to_string(),
         state,
+        vec![],
         handlers,
         vec![stream1, stream2],
     )

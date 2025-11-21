@@ -11,7 +11,7 @@ use tokio_tungstenite::connect_async;
 
 use crate::{
     handler::WsHandler,
-    types::{Action, HandlerOutcome, WsStream},
+    types::{Action, ConnectHandler, HandlerOutcome, WsStream},
 };
 
 pub fn bind_stream<S, M, St, F>(stream: St, logic: F) -> BoxStream<'static, Action<S>>
@@ -35,6 +35,7 @@ where
 pub async fn run_ws_loop<S, H>(
     url: String,
     mut state: S,
+    on_connect: Vec<ConnectHandler<S>>,
     handler: H,
     input_streams: Vec<BoxStream<'static, Action<S>>>,
 ) -> Result<()>
@@ -54,6 +55,11 @@ where
             }
         };
         println!("✅ Connected!");
+
+        // Run on_connect handlers
+        for connect_handler in &on_connect {
+            connect_handler(&mut stream, &mut state).await;
+        }
 
         loop {
             tokio::select! {

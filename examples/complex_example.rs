@@ -14,7 +14,7 @@ use rust_ws::{
         subscription::{SubscriptionState, send_subscriptions},
     },
     state::Conn,
-    types::{HandlerOutcome, WsStream},
+    types::{ConnectHandler, HandlerOutcome, WsStream},
 };
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
@@ -42,7 +42,7 @@ fn make_state(tx: mpsc::UnboundedSender<String>) -> WsState {
             subscriptions: vec!["{\"action\": \"sub\", \"channel\": \"ticker\"}".to_string()],
             subscribed: false,
         },
-        ForwarderState { sender: Some(tx) },
+        ForwarderState { sender: tx },
         PingState::default(),
         LastMsg::default(),
         Heartbeat::default(),
@@ -112,31 +112,21 @@ async fn main() -> Result<()> {
 
     // --- Streams (Triggers) ---
 
-    // 1. Auth Stream: Tries to authenticate every 1s (until successful)
-    let auth_stream =
-        tokio_stream::wrappers::IntervalStream::new(tokio::time::interval(Duration::from_secs(1)));
-
-    // 2. Sub Stream: Tries to subscribe every 1s (until successful)
-    let sub_stream =
-        tokio_stream::wrappers::IntervalStream::new(tokio::time::interval(Duration::from_secs(1)));
-
-    // 3. Timeout Stream: Checks for ping timeout every 5s
+    // 1. Timeout Stream: Checks for ping timeout every 5s
     let timeout_stream =
         tokio_stream::wrappers::IntervalStream::new(tokio::time::interval(Duration::from_secs(5)));
 
     // --- Actions (Binding Streams to Logic) ---
 
-    let action_auth = bind_stream(auth_stream, |ws, state: &mut WsState, _| {
-        send_auth(ws, state, ())
-    });
-
-    let action_sub = bind_stream(sub_stream, |ws, state: &mut WsState, _| {
-        send_subscriptions(ws, state, ())
-    });
-
     let action_timeout = bind_stream(timeout_stream, |ws, state: &mut WsState, _| {
         check_timeout(ws, state, ())
     });
+
+    // --- On Connect Handlers ---
+    let on_connect: Vec<ConnectHandler<WsState>> = vec![
+        Box::new(|ws, state| send_auth(ws, state, ())),
+        Box::new(|ws, state| send_subscriptions(ws, state, ())),
+    ];
 
     // --- Handlers (Processing Incoming Messages) ---
 
@@ -152,8 +142,9 @@ async fn main() -> Result<()> {
     run_ws_loop(
         "ws://localhost:1234".to_string(),
         state,
+        on_connect,
         handlers,
-        vec![action_auth, action_sub, action_timeout],
+        vec![action_timeout],
     )
     .await
 }
