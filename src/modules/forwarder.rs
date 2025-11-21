@@ -15,6 +15,15 @@ pub trait MessageParser<T> {
     fn parse(&self, msg: &Message) -> Option<T>;
 }
 
+impl<F, T> MessageParser<T> for F
+where
+    F: Fn(&Message) -> Option<T> + Send + Sync,
+{
+    fn parse(&self, msg: &Message) -> Option<T> {
+        self(msg)
+    }
+}
+
 // A generic handler that parses messages and forwards them
 pub fn forward_messages<'a, S, I, T, P>(
     _ws: &'a mut WsStream,

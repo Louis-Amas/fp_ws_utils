@@ -32,6 +32,19 @@ where
     }
 }
 
+/// Helper function to guide type inference for closures implementing WsHandler.
+/// This ensures the closure satisfies the higher-ranked lifetime bounds (HRTB).
+pub fn to_handler<F, S>(f: F) -> F
+where
+    F: for<'a> Fn(
+        &'a mut WsStream,
+        &'a mut S,
+        &'a Message,
+    ) -> BoxFuture<'a, Result<HandlerOutcome>>,
+{
+    f
+}
+
 impl<S, Head, Tail> WsHandler<S> for HCons<Head, Tail>
 where
     Head: WsHandler<S> + Sync,

@@ -2,19 +2,19 @@ use std::time::Duration;
 
 use anyhow::Result;
 use frunk::{HCons, HNil, hlist};
-use futures::future::BoxFuture;
 use rust_ws::{
     engine::{bind_stream, run_ws_loop},
+    handler::to_handler,
     modules::{
         auth::{AuthState, send_auth},
-        forwarder::{ForwarderState, MessageParser, forward_messages},
+        forwarder::{ForwarderState, forward_messages},
         heartbeat::{Heartbeat, update_pong},
         logging::{LastMsg, log_text},
         ping_pong::{PingState, check_timeout, handle_ping_pong},
         subscription::{SubscriptionState, send_subscriptions},
     },
     state::Conn,
-    types::{ConnectHandler, HandlerOutcome, WsStream},
+    types::ConnectHandler,
 };
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
@@ -40,7 +40,6 @@ fn make_state(tx: mpsc::UnboundedSender<String>) -> WsState {
         },
         SubscriptionState {
             subscriptions: vec!["{\"action\": \"sub\", \"channel\": \"ticker\"}".to_string()],
-            subscribed: false,
         },
         ForwarderState { sender: tx },
         PingState::default(),
@@ -52,48 +51,12 @@ fn make_state(tx: mpsc::UnboundedSender<String>) -> WsState {
 
 // 2. Define a Parser for the Forwarder
 // This logic extracts data from the WS message to send it to the rest of the app.
-struct SimpleParser;
-static PARSER: SimpleParser = SimpleParser;
-impl MessageParser<String> for SimpleParser {
-    fn parse(&self, msg: &Message) -> Option<String> {
-        if let Message::Text(t) = msg {
-            Some(t.to_string())
-        } else {
-            None
-        }
+fn simple_parser(msg: &Message) -> Option<String> {
+    if let Message::Text(t) = msg {
+        Some(t.to_string())
+    } else {
+        None
     }
-}
-
-fn my_ping_handler<'a>(
-    ws: &'a mut WsStream,
-    state: &'a mut WsState,
-    msg: &'a Message,
-) -> BoxFuture<'a, Result<HandlerOutcome>> {
-    handle_ping_pong(ws, state, msg)
-}
-
-fn my_forwarder<'a>(
-    ws: &'a mut WsStream,
-    state: &'a mut WsState,
-    msg: &'a Message,
-) -> BoxFuture<'a, Result<HandlerOutcome>> {
-    forward_messages(ws, state, msg, &PARSER)
-}
-
-fn my_pong_updater<'a>(
-    ws: &'a mut WsStream,
-    state: &'a mut WsState,
-    msg: &'a Message,
-) -> BoxFuture<'a, Result<HandlerOutcome>> {
-    update_pong(ws, state, msg)
-}
-
-fn my_logger<'a>(
-    ws: &'a mut WsStream,
-    state: &'a mut WsState,
-    msg: &'a Message,
-) -> BoxFuture<'a, Result<HandlerOutcome>> {
-    log_text(ws, state, msg)
 }
 
 #[tokio::main]
@@ -132,10 +95,10 @@ async fn main() -> Result<()> {
 
     // The Chain of Responsibility
     let handlers = hlist![
-        my_ping_handler, // 1. Handle Pings automatically
-        my_forwarder,    // 2. Parse and forward interesting messages
-        my_pong_updater, // 3. Update pong state
-        my_logger        // 4. Log everything else
+        to_handler(|ws, state, msg| handle_ping_pong(ws, state, msg)),
+        to_handler(|ws, state, msg| forward_messages(ws, state, msg, &simple_parser)),
+        to_handler(|ws, state, msg| update_pong(ws, state, msg)),
+        to_handler(|ws, state, msg| log_text(ws, state, msg))
     ];
 
     println!("🤖 Starting Complex Bot...");

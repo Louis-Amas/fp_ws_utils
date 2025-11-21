@@ -7,19 +7,9 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::types::WsStream;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct SubscriptionState {
     pub subscriptions: Vec<String>,
-    pub subscribed: bool,
-}
-
-impl Default for SubscriptionState {
-    fn default() -> Self {
-        Self {
-            subscriptions: vec![],
-            subscribed: false,
-        }
-    }
 }
 
 // Action to send subscriptions
@@ -33,12 +23,11 @@ where
 {
     async move {
         let sub_state: &mut SubscriptionState = state.get_mut();
-        if !sub_state.subscribed && !sub_state.subscriptions.is_empty() {
+        if !sub_state.subscriptions.is_empty() {
             for sub in &sub_state.subscriptions {
                 println!("📡 Subscribing: {}", sub);
                 let _ = ws.send(Message::Text(sub.clone().into())).await;
             }
-            sub_state.subscribed = true;
         }
     }
     .boxed()
