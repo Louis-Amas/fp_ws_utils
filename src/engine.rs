@@ -14,7 +14,7 @@ where
     S: 'static,
     M: Send + 'static,
     St: futures::Stream<Item = M> + Send + 'static,
-    F: Fn(&mut WsStream, &mut S, M) -> BoxFuture<'static, ()> + Send + Sync + 'static,
+    F: for<'a> Fn(&'a mut WsStream, &'a mut S, M) -> BoxFuture<'a, ()> + Send + Sync + 'static,
 {
     let logic = Arc::new(logic);
 

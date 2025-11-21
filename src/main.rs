@@ -5,6 +5,8 @@ use futures::StreamExt;
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::time::sleep;
+use futures::SinkExt;
+use tokio_tungstenite::tungstenite::Message;
 
 // Import from the library (assuming package name is 'rust_ws')
 use rust_ws::state::{make_state, WsState, LastMsg, Heartbeat};
@@ -19,9 +21,12 @@ async fn main() -> Result<()> {
     let (tx, rx) = broadcast::channel(16);
     // Simulate external events
     tokio::spawn(async move {
+        let mut i = 0;
+
         loop {
             sleep(Duration::from_secs(1)).await;
-            let _ = tx.send("Hello".to_string());
+            let _ = tx.send(format!("Hello {i}"));
+            i += 1;
         }
     });
 
@@ -33,10 +38,12 @@ async fn main() -> Result<()> {
     let heartbeat_stream =
         tokio_stream::wrappers::IntervalStream::new(tokio::time::interval(Duration::from_secs(5)));
 
-    let stream1 = bind_stream(broadcast_stream, |_, state: &mut WsState, msg: String| {
+    let stream1 = bind_stream(broadcast_stream, |ws, state: &mut WsState, msg: String| {
         let last: &mut LastMsg = state.get_mut(); // Frunk getter
         println!("📢 Broadcast: {msg} (Last WS msg: {:?})", last.last_msg);
-        async {}.boxed()
+        async move {
+            let _ = ws.send(Message::Text(msg.into())).await;
+        }.boxed()
     });
 
     let stream2 = bind_stream(heartbeat_stream, |_, state: &mut WsState, _instant| {
