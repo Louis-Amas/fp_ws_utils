@@ -46,7 +46,7 @@ async fn main() -> Result<()> {
 
     // On Connect: Subscribe to BTC L2 Book (Public Data)
     let on_connect: Vec<ConnectHandler<WsState>> =
-        vec![Box::new(|ws, state| send_subscriptions(ws, state, ()))];
+        vec![Box::new(|ws, state| send_subscriptions(ws, state))];
 
     // Handlers
     // 1. Standard Ping/Pong (Protocol level)

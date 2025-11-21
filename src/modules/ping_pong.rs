@@ -56,7 +56,6 @@ where
 pub fn check_timeout<'a, S, I>(
     _ws: &'a mut WsStream,
     state: &'a mut S,
-    _msg: (),
 ) -> BoxFuture<'a, ()>
 where
     S: Selector<PingState, I> + Send + 'static,

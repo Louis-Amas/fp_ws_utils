@@ -81,13 +81,13 @@ async fn main() -> Result<()> {
     // --- Actions (Binding Streams to Logic) ---
 
     let action_timeout = bind_stream(timeout_stream, |ws, state: &mut WsState, _| {
-        check_timeout(ws, state, ())
+        check_timeout(ws, state)
     });
 
     // --- On Connect Handlers ---
     let on_connect: Vec<ConnectHandler<WsState>> = vec![
-        Box::new(|ws, state| send_auth(ws, state, ())),
-        Box::new(|ws, state| send_subscriptions(ws, state, ())),
+        Box::new(|ws, state| send_auth(ws, state)),
+        Box::new(|ws, state| send_subscriptions(ws, state)),
     ];
 
     // --- Handlers (Processing Incoming Messages) ---

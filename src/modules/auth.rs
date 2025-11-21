@@ -16,7 +16,6 @@ pub struct AuthState {
 pub fn send_auth<'a, S, I>(
     ws: &'a mut WsStream,
     state: &'a mut S,
-    _trigger: (),
 ) -> BoxFuture<'a, ()>
 where
     S: Selector<AuthState, I> + Send + 'static,

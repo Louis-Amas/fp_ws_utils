@@ -16,7 +16,6 @@ pub struct SubscriptionState {
 pub fn send_subscriptions<'a, S, I>(
     ws: &'a mut WsStream,
     state: &'a mut S,
-    _trigger: (),
 ) -> BoxFuture<'a, ()>
 where
     S: Selector<SubscriptionState, I> + Send + 'static,
