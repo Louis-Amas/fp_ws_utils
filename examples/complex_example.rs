@@ -36,7 +36,6 @@ fn make_state(tx: mpsc::UnboundedSender<String>) -> WsState {
     hlist![
         AuthState {
             auth_message: Some("{\"action\": \"auth\", \"token\": \"secret\"}".to_string()),
-            authenticated: false,
         },
         SubscriptionState {
             subscriptions: vec!["{\"action\": \"sub\", \"channel\": \"ticker\"}".to_string()],

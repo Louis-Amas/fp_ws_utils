@@ -8,12 +8,12 @@ name = "rust_ws"
 path = "src/lib.rs"
 
 [[example]]
-name = "simple_example"
-path = "examples/simple_example.rs"
+name = "simple_bot"
+path = "examples/simple_bot.rs"
 
 [[example]]
-name = "complex_example"
-path = "examples/complex_example.rs"
+name = "hyperliquid_example"
+path = "examples/hyperliquid_example.rs"
 
 [dependencies]
 anyhow = "1.0.100"
@@ -22,6 +22,7 @@ futures = "0.3.31"
 futures-util = "0.3.31"
 frunk = "0.4.4"
 tokio = { version = "1.45.1", features = ["full"] }
-tokio-tungstenite = "0.28.0"
+tokio-tungstenite = { version = "0.28.0", features = ["native-tls"] }
 tokio-stream = { version = "0.1.17", features = ["sync"] }
 paste = "1.0.15"
+serde_json = "1.0.145"
