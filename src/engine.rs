@@ -54,7 +54,7 @@ where
             tokio::select! {
                 maybe_msg = stream.next() => {
                     match maybe_msg {
-                        Some(Ok(msg)) => match handler.handle(&mut state, &msg)? {
+                        Some(Ok(msg)) => match handler.handle(&mut stream, &mut state, &msg).await? {
                             HandlerOutcome::Continue => {}
                             HandlerOutcome::Reconnect => break,
                             HandlerOutcome::Stop => return Ok(()),
