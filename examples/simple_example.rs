@@ -5,21 +5,18 @@ use frunk::{HCons, HNil, hlist};
 use futures::{FutureExt, SinkExt, StreamExt};
 // Import from the library (assuming package name is 'rust_ws')
 use rust_ws::engine::{bind_stream, run_ws_loop};
-use rust_ws::{
-    modules::{
-        heartbeat::{Heartbeat, update_pong},
-        logging::{LastMsg, log_text},
-    },
-    state::Conn,
+use rust_ws::handlers::{
+    heartbeat::{Heartbeat, update_pong},
+    logging::{LastMsg, log_text},
 };
 use tokio::{sync::broadcast, time::sleep};
 use tokio_tungstenite::tungstenite::Message;
 
 // Define WsState here in main
-pub type WsState = HCons<LastMsg, HCons<Heartbeat, HCons<Conn, HNil>>>;
+pub type WsState = HCons<LastMsg, HCons<Heartbeat, HNil>>;
 
 fn make_state() -> WsState {
-    hlist![LastMsg::default(), Heartbeat::default(), Conn::default(),]
+    hlist![LastMsg::default(), Heartbeat::default()]
 }
 
 #[tokio::main]

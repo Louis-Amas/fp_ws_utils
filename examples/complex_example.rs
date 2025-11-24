@@ -15,7 +15,6 @@ use rust_ws::{
         auth::{AuthState, send_auth},
         subscription::{SubscriptionState, send_subscriptions},
     },
-    state::Conn,
     types::ConnectHandler,
 };
 use tokio::sync::mpsc;
@@ -27,10 +26,7 @@ pub type WsState = HCons<
     AuthState,
     HCons<
         SubscriptionState,
-        HCons<
-            ForwarderState<String>,
-            HCons<PingState, HCons<LastMsg, HCons<Heartbeat, HCons<Conn, HNil>>>>,
-        >,
+        HCons<ForwarderState<String>, HCons<PingState, HCons<LastMsg, HCons<Heartbeat, HNil>>>>,
     >,
 >;
 
@@ -46,7 +42,6 @@ fn make_state(tx: mpsc::UnboundedSender<String>) -> WsState {
         PingState::default(),
         LastMsg::default(),
         Heartbeat::default(),
-        Conn::default(),
     ]
 }
 

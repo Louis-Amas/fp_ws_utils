@@ -8,14 +8,13 @@ use rust_ws::{
         ping_pong::{PingState, handle_ping_pong},
     },
     on_connect::subscription::{SubscriptionState, send_subscriptions},
-    state::Conn,
     types::ConnectHandler,
 };
 use serde_json::json;
 
 // Define the State
 // We just need the basic connection state and logging state for this simple example
-pub type WsState = HCons<SubscriptionState, HCons<PingState, HCons<LastMsg, HCons<Conn, HNil>>>>;
+pub type WsState = HCons<SubscriptionState, HCons<PingState, HCons<LastMsg, HNil>>>;
 
 fn make_state() -> WsState {
     let sub_msg = json!({
@@ -33,7 +32,6 @@ fn make_state() -> WsState {
         },
         PingState::default(),
         LastMsg::default(),
-        Conn::default()
     ]
 }
 
