@@ -1,14 +1,13 @@
-use std::time::{Duration, Instant};
-
+use crate::types::{ContextState, HandlerOutcome, WsStream};
 use anyhow::Result;
 use frunk::hlist::Selector;
 use futures::{
     SinkExt,
     future::{BoxFuture, FutureExt},
 };
+use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::Message;
-
-use crate::types::{HandlerOutcome, WsStream};
+use tracing::warn;
 
 #[derive(Clone, Debug)]
 pub struct PingState {
@@ -53,19 +52,25 @@ where
 }
 
 // This function checks if we timed out
-pub fn check_timeout<'a, S, I>(_ws: &'a mut WsStream, state: &'a mut S) -> BoxFuture<'a, ()>
+pub fn check_timeout<'a, S, I, J>(
+    _ws: &'a mut WsStream,
+    state: &'a mut S,
+) -> BoxFuture<'a, HandlerOutcome>
 where
-    S: Selector<PingState, I> + Send + 'static,
+    S: Selector<PingState, I> + Selector<ContextState, J> + Send + 'static,
 {
     async move {
-        let ps: &mut PingState = state.get_mut();
-        if ps.last_pong.elapsed() > ps.ping_interval + ps.pong_timeout {
-            println!("⏰ Ping timeout! Reconnecting...");
-            // In a real scenario, we might want to trigger a reconnection here.
-            // However, 'bind_stream' actions return (), so they can't directly force a reconnect via return value.
-            // We would typically close the stream or use a shared flag.
-            // For now, we just log.
+        let timeout = {
+            let ps: &mut PingState = state.get_mut();
+            ps.last_pong.elapsed() > ps.ping_interval + ps.pong_timeout
+        };
+
+        if timeout {
+            let ctx: &ContextState = state.get();
+            warn!("[{}] ⏰ Ping timeout! Reconnecting...", ctx.context);
+            return HandlerOutcome::Reconnect;
         }
+        HandlerOutcome::Continue
     }
     .boxed()
 }

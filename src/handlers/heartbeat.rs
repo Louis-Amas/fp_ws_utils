@@ -1,11 +1,9 @@
-use std::time::Instant;
-
+use crate::types::{HandlerOutcome, WsStream};
 use anyhow::Result;
 use frunk::hlist::Selector;
 use futures::future::{BoxFuture, FutureExt};
+use std::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
-
-use crate::types::{HandlerOutcome, WsStream};
 
 #[derive(Clone, Debug)]
 pub struct Heartbeat {

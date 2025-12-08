@@ -1,9 +1,8 @@
+use crate::types::{HandlerOutcome, WsStream};
 use anyhow::Result;
 use frunk::{HCons, HNil};
 use futures::future::{BoxFuture, FutureExt};
 use tokio_tungstenite::tungstenite::Message;
-
-use crate::types::{HandlerOutcome, WsStream};
 
 pub trait WsHandler<S> {
     fn handle<'a>(

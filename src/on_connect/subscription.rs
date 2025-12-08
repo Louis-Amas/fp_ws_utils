@@ -1,11 +1,11 @@
+use crate::types::{ContextState, WsStream};
 use frunk::hlist::Selector;
 use futures::{
     SinkExt,
     future::{BoxFuture, FutureExt},
 };
 use tokio_tungstenite::tungstenite::Message;
-
-use crate::types::WsStream;
+use tracing::info;
 
 #[derive(Clone, Debug, Default)]
 pub struct SubscriptionState {
@@ -13,19 +13,17 @@ pub struct SubscriptionState {
 }
 
 // Action to send subscriptions
-pub fn send_subscriptions<'a, S, I>(
-    ws: &'a mut WsStream,
-    state: &'a mut S,
-) -> BoxFuture<'a, ()>
+pub fn send_subscriptions<'a, S, I, J>(ws: &'a mut WsStream, state: &'a mut S) -> BoxFuture<'a, ()>
 where
-    S: Selector<SubscriptionState, I> + Send + 'static,
+    S: Selector<SubscriptionState, I> + Selector<ContextState, J> + Send + 'static,
 {
     async move {
-        let sub_state: &mut SubscriptionState = state.get_mut();
+        let ctx: &ContextState = state.get();
+        let sub_state: &SubscriptionState = state.get();
         if !sub_state.subscriptions.is_empty() {
             for sub in &sub_state.subscriptions {
-                println!("📡 Subscribing: {}", sub);
-                let _ = ws.send(Message::Text(sub.clone().into())).await;
+                info!("[{}] 📡 Subscribing: {}", ctx.context, sub);
+                let _ = ws.send(Message::Text(sub.into())).await;
             }
         }
     }

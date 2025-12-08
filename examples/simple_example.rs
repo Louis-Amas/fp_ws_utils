@@ -1,26 +1,34 @@
-use std::time::Duration;
-
 use anyhow::Result;
 use frunk::{HCons, HNil, hlist};
-use futures::{FutureExt, SinkExt, StreamExt};
 // Import from the library (assuming package name is 'rust_ws')
-use rust_ws::engine::{bind_stream, run_ws_loop};
-use rust_ws::handlers::{
-    heartbeat::{Heartbeat, update_pong},
-    logging::{LastMsg, log_text},
+use frunk_ws::engine::{bind_stream, run_ws_loop};
+use frunk_ws::{
+    handlers::{
+        heartbeat::{Heartbeat, update_pong},
+        logging::{LastMsg, log_text},
+    },
+    types::{ContextState, HandlerOutcome},
 };
+use futures::{FutureExt, SinkExt, StreamExt};
+use std::time::Duration;
 use tokio::{sync::broadcast, time::sleep};
 use tokio_tungstenite::tungstenite::Message;
+use tracing::info;
 
 // Define WsState here in main
-pub type WsState = HCons<LastMsg, HCons<Heartbeat, HNil>>;
+pub type WsState = HCons<LastMsg, HCons<Heartbeat, HCons<ContextState, HNil>>>;
 
 fn make_state() -> WsState {
-    hlist![LastMsg::default(), Heartbeat::default()]
+    hlist![
+        LastMsg::default(),
+        Heartbeat::default(),
+        ContextState::new("SimpleExample")
+    ]
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
     let state = make_state();
 
     // Stream A: Broadcast Channel
@@ -46,17 +54,18 @@ async fn main() -> Result<()> {
 
     let stream1 = bind_stream(broadcast_stream, |ws, state: &mut WsState, msg: String| {
         let last: &mut LastMsg = state.get_mut(); // Frunk getter
-        println!("📢 Broadcast: {msg} (Last WS msg: {:?})", last.last_msg);
+        info!("📢 Broadcast: {msg} (Last WS msg: {:?})", last.last_msg);
         async move {
-            let _ = ws.send(Message::Text(msg.into())).await;
+            let _ = ws.send(Message::Text(msg)).await;
+            HandlerOutcome::Continue
         }
         .boxed()
     });
 
     let stream2 = bind_stream(heartbeat_stream, |_, state: &mut WsState, _instant| {
         let hb: &mut Heartbeat = state.get_mut(); // Frunk getter
-        println!("❤️ Heartbeat tick (Last pong: {:?})", hb.last_pong);
-        async {}.boxed()
+        info!("❤️ Heartbeat tick (Last pong: {:?})", hb.last_pong);
+        async { HandlerOutcome::Continue }.boxed()
     });
 
     let handlers = hlist![
